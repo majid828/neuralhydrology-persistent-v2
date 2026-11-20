@@ -4,7 +4,8 @@ validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
 test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
 
 run_dir: /home/mhshah1/runs/cudalstm_daily_compare
-experiment_name: cudalstm_daily_compare
+experiment_name: fssts365_nonstationary_basins
+seed: 555
 
 train_start_date: '01/01/1990'
 train_end_date: '30/09/2008'

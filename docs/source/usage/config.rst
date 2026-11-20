@@ -452,6 +452,38 @@ Training settings
    are stored to disk. ``1`` means to store the weights after each
    epoch, which is the default if not otherwise specified.
    
+Persistent-state LSTM settings
+------------------------------
+Used with ``model: persistentlstm`` (see ``neuralhydrology/utils/persistentutils.py`` for the checks that are applied).
+
+-  ``persistent_state``: True/False. Carry each basin's detached hidden and cell state between consecutive,
+   time-contiguous segments within an epoch (truncated backpropagation through time). Requires
+   ``model: persistentlstm``, a single frequency, ``non_overlapping_sequences: True``,
+   ``predict_last_n == seq_length`` and ``seq_stride`` equal to 1 or ``seq_length``.
+
+-  ``non_overlapping_sequences``: True/False. Split each basin's series into non-overlapping segments of length
+   ``seq_length`` on a fixed time grid.
+
+-  ``seq_stride``: Distance between segment ends (1 or ``seq_length`` for persistent training).
+
+-  ``eval_warmup_steps``: Number of time steps per basin at the start of each evaluation stream that only update the
+   state and are not scored.
+
+-  ``eval_warmup_from_preceding_period``: True/False. Take the warm-up from the forcing preceding the period start,
+   so that the whole evaluation period is scored. Requires ``eval_warmup_steps`` to be a multiple of
+   ``seq_length``.
+
+-  ``save_persistent_states``: True/False. Save each basin's final state and its time stamp next to the evaluation
+   results.
+
+-  ``persistent_state_init_file``: Path to a saved-states file. Each basin's evaluation starts from its saved state
+   if that state ends one time step before the evaluation stream starts (stand-alone evaluation only).
+
+-  ``ablate_state_carry``: True/False. Ablation: start every flattened batch from a zero state.
+
+-  ``qobs_15min_to_utc``: True/False (default True). Convert USGS 15-min discharge time stamps to UTC with the
+   ``tz_cd`` column (``fifteenmin_camels_us`` dataset).
+
 Finetune settings
 -----------------
 

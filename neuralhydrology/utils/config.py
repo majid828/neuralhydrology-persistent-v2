@@ -217,6 +217,16 @@ class Config(object):
     # ==========================================================
 
     @property
+    def qobs_15min_to_utc(self) -> bool:
+        """Convert USGS 15-min discharge time stamps from local clock time (RDB column 'tz_cd') to UTC.
+
+        USGS instantaneous-value RDB files report 'datetime' in the site's local time (e.g. PST/PDT) with the time
+        zone in 'tz_cd'. The hourly NLDAS forcings are in UTC, so without conversion the targets would be shifted by
+        the UTC offset (7-8 h for Pacific sites) relative to the forcings. Default: True.
+        """
+        return self._cfg.get("qobs_15min_to_utc", True)
+
+    @property
     def qobs_15min_dir(self) -> Path:
         """Directory containing 15-min discharge (target) data.
 
@@ -771,17 +781,20 @@ class Config(object):
     # CHANGE (NEW): these properties fix your exact error.
     @property
     def persist_state_across_epochs(self) -> bool:
-        """If True, save per-basin (h,c) at end of an epoch and reload next epoch start."""
+        """Deprecated and ignored: states are never carried across epochs (manuscript Eq. 14).
+        Kept only so that older config files still load."""
         return self._cfg.get("persist_state_across_epochs", False)
 
     @property
     def shuffle_basins_each_epoch(self) -> bool:
-        """If True, shuffle basin order each epoch (trainer must implement)."""
+        """Deprecated and ignored: basin order is always re-randomized every epoch (manuscript Sec. 2.5).
+        Kept only so that older config files still load."""
         return self._cfg.get("shuffle_basins_each_epoch", False)
 
     @property
     def persistent_state_dir(self) -> Path:
-        """Directory where per-basin states are stored.
+        """Deprecated and unused (states are saved next to the evaluation results, see save_persistent_states).
+        Directory where per-basin states are stored.
 
         CHANGE (NEW):
         - If YAML path is relative, resolve it inside run_dir (if known) so it stays with the run outputs.
@@ -804,8 +817,44 @@ class Config(object):
 
     @property
     def use_persistent_state_files_in_eval(self) -> bool:
-        """If True, evaluation can warm-start from per-basin state files (tester must implement)."""
+        """Deprecated alias: evaluation warm-starts from saved states when 'persistent_state_init_file' is set."""
         return self._cfg.get("use_persistent_state_files_in_eval", False)
+
+    @property
+    def eval_warmup_from_preceding_period(self) -> bool:
+        """If True, the evaluation warm-up (eval_warmup_steps) is taken from the forcing BEFORE the period start.
+
+        The persistent model then spins up on the eval_warmup_steps time steps preceding e.g. test_start_date
+        (forcing only; targets before the period start are always NaN), and metrics cover the full evaluation period,
+        i.e. exactly the same dates on which non-persistent baselines are scored. If False, the warm-up consumes the
+        first eval_warmup_steps time steps of the period itself, which are then excluded from the metrics.
+        """
+        return self._cfg.get("eval_warmup_from_preceding_period", False)
+
+    @property
+    def ablate_state_carry(self) -> bool:
+        """Ablation switch: if True, every flattened batch starts from a zero state (training and evaluation).
+
+        Everything else (segments, batch composition, loss, gradient horizon B*L) stays identical, so comparing runs
+        with this switch on and off isolates the effect of carrying (h, c) across batches.
+        """
+        return self._cfg.get("ablate_state_carry", False)
+
+    @property
+    def save_persistent_states(self) -> bool:
+        """If True, the tester writes each basin's final (h, c) and its time stamp to
+        '<run_dir>/<period>/<model_epochXXX>/<period>_persistent_states.p' whenever results are saved."""
+        return self._cfg.get("save_persistent_states", False)
+
+    @property
+    def persistent_state_init_file(self) -> Optional[Path]:
+        """Optional file written with 'save_persistent_states' (e.g. at the end of the validation period).
+
+        Evaluation then initializes each basin from its saved (h, c) instead of a zero state, provided the saved state
+        ends exactly one time step before the evaluation stream starts. Otherwise that basin starts from zero.
+        """
+        value = self._cfg.get("persistent_state_init_file", None)
+        return None if value is None else Path(value)
 
     @property
     def non_overlapping_sequences(self) -> bool:

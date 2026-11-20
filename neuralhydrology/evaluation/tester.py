@@ -31,6 +31,8 @@ from neuralhydrology.training import get_loss_obj, get_regularization_obj
 from neuralhydrology.training.logger import Logger
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.errors import AllNaNError, NoEvaluationDataError
+from neuralhydrology.utils.persistentutils import (contiguous_batches, infer_time_step, state_is_finite,
+                                                   uses_persistent_state, validate_persistent_config)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ class BaseTester(object):
     """Base class to run inference on a model."""
 
     def __init__(self, cfg: Config, run_dir: Path, period: str = "test", init_model: bool = True):
+        validate_persistent_config(cfg)
         self.cfg = cfg
         self.run_dir = run_dir
         self.init_model = init_model
@@ -69,8 +72,12 @@ class BaseTester(object):
         self.loss_obj = get_loss_obj(cfg)
         self.loss_obj.set_regularization_terms(get_regularization_obj(cfg=self.cfg))
 
-        # persistent hidden for evaluation (reset per basin)
+        # persistent hidden for evaluation (reset per basin) and the time stamp of the last step it summarizes
         self._persistent_hidden_eval: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._persistent_state_end_eval: Optional[np.datetime64] = None
+        # optional initial states loaded from a file written with save_persistent_states (basin -> dict)
+        self._persistent_init_states: Dict[str, dict] = {}
+        self._persistent_basin_eval: Optional[str] = None
 
         # NEW: evaluation drop_last switch (default: False for unbiased metrics)
         # If you want to exactly mirror training behavior, set eval_drop_last: True in YAML.
@@ -166,25 +173,26 @@ class BaseTester(object):
         return None
 
     def _get_chrono_loader(self, ds: BaseDataset) -> DataLoader:
+        """Batches of up to batch_size consecutive, time-contiguous windows of one basin, in chronological order."""
         n = len(ds)
         if n == 0:
             return DataLoader(ds, batch_size=self.cfg.batch_size, num_workers=0, collate_fn=ds.collate_fn)
 
-        items: List[Tuple[int, Union[int, np.int64]]] = []
+        items: List[Tuple[int, Any, Any]] = []
+        step = None
         for i in range(n):
             sample = ds[i]
-            t0 = self._infer_sample_start_time(sample)
-            if t0 is None:
-                t0 = np.int64(i)
-            items.append((i, t0))
-
-        items_sorted = sorted(items, key=lambda x: x[1])
-        sorted_indices = [i for i, _ in items_sorted]
+            if "date" not in sample:
+                raise RuntimeError("Persistent eval requires the 'date' of every window.")
+            d = np.asarray(sample["date"]).reshape(-1)
+            if step is None:
+                step = infer_time_step(d[None, :], ds.frequencies[0] if ds.frequencies else None)
+            items.append((i, d[0], d[-1]))
 
         batch_size = int(self.cfg.batch_size)
-        batches = [sorted_indices[i: i + batch_size] for i in range(0, len(sorted_indices), batch_size)]
+        batches = contiguous_batches(items, batch_size=batch_size, step=step)
 
-        # NEW: evaluation drop_last behavior is configurable (default False)
+        # evaluation drop_last behavior is configurable (default False: every window is evaluated)
         if self._eval_drop_last:
             batches = [b for b in batches if len(b) == batch_size]
 
@@ -320,12 +328,21 @@ class BaseTester(object):
         results = defaultdict(dict)
         all_output = {basin: None for basin in basins}
 
+        persistent_eval = uses_persistent_state(self.cfg)
+        final_states: Dict[str, dict] = {}
+        self._persistent_init_states = {}
+        # initial states from file only in stand-alone evaluation (not in the validation runs during training)
+        if persistent_eval and self.init_model and self.cfg.persistent_state_init_file is not None:
+            self._persistent_init_states = self._load_persistent_states(self.cfg.persistent_state_init_file)
+
         pbar = tqdm(basins, file=sys.stdout, disable=self._disable_pbar)
         pbar.set_description("# Validation" if self.period == "validation" else "# Evaluation")
 
         for basin in pbar:
             # reset hidden per basin (no leakage across basins)
             self._persistent_hidden_eval = None
+            self._persistent_state_end_eval = None
+            self._persistent_basin_eval = basin
 
             if self.cfg.cache_validation_data and basin in self.cached_datasets.keys():
                 ds = self.cached_datasets[basin]
@@ -337,11 +354,23 @@ class BaseTester(object):
                 if self.cfg.cache_validation_data and self.period == "validation":
                     self.cached_datasets[basin] = ds
 
-            loader = self._get_chrono_loader(ds)
+            if self._is_persistent_mirror_eval(ds.frequencies):
+                loader = self._get_chrono_loader(ds)
+            else:
+                # non-persistent models: upstream NeuralHydrology loader (windows in dataset order)
+                loader = DataLoader(ds, batch_size=self.cfg.batch_size, num_workers=0, collate_fn=ds.collate_fn)
 
             y_hat, y, dates, mean_losses, all_output[basin] = self._evaluate(
                 model, loader, ds.frequencies, save_all_output
             )
+
+            if self._is_persistent_mirror_eval(ds.frequencies) and self._persistent_hidden_eval is not None:
+                h, c = self._persistent_hidden_eval
+                final_states[basin] = {
+                    "h": h.detach().cpu().numpy(),
+                    "c": c.detach().cpu().numpy(),
+                    "last_date": self._persistent_state_end_eval,
+                }
 
             if experiment_logger is not None:
                 experiment_logger.log_step(**{k: (v, len(loader)) for k, v in mean_losses.items()})
@@ -527,35 +556,41 @@ class BaseTester(object):
         if save_results or save_all_output:
             self._save_results(results=results_to_save, states=states_to_save, epoch=epoch)
 
+        if save_results and persistent_eval and self.cfg.save_persistent_states:
+            self._save_persistent_states(final_states, epoch=epoch)
+
         return results
 
     # ------------------------------------------------------------------
     # Core _evaluate()
     # ------------------------------------------------------------------
+    def _get_predictions_and_loss(self, model: BaseModel, data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, float]:
+        predictions = model(data)
+        _, all_losses = self.loss_obj(predictions, data)
+        return predictions, {k: v.item() for k, v in all_losses.items()}
+
     def _evaluate(self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False):
+        """Evaluate model"""
         if self._is_persistent_mirror_eval(frequencies):
             return self._evaluate_persistent_match_training_with_flatten(model, loader, frequencies, save_all_output)
 
-        # original NH non-persistent path
+        # original NH non-persistent path (identical to upstream NeuralHydrology)
         predict_last_n = self.cfg.predict_last_n
         if isinstance(predict_last_n, int):
-            predict_last_n = {frequencies[0]: predict_last_n}
+            predict_last_n = {frequencies[0]: predict_last_n}  # if predict_last_n is int, there's only one frequency
 
         preds, obs, dates, all_output = {}, {}, {}, {}
         losses = []
-
         with torch.no_grad():
             for data in loader:
-                for key in data:
-                    if key.startswith("x_d"):
-                        data[key] = {k: v.to(self.device) for k, v in data[key].items()}
-                    elif not key.startswith("date"):
-                        data[key] = data[key].to(self.device)
 
+                for key in data:
+                    if key.startswith('x_d'):
+                        data[key] = {k: v.to(self.device) for k, v in data[key].items()}
+                    elif not key.startswith('date'):
+                        data[key] = data[key].to(self.device)
                 data = model.pre_model_hook(data, is_train=False)
-                predictions = model(data)
-                _, all_losses = self.loss_obj(predictions, data)
-                losses.append({k: v.item() for k, v in all_losses.items()})
+                predictions, loss = self._get_predictions_and_loss(model, data)
 
                 if all_output:
                     for key, value in predictions.items():
@@ -570,10 +605,11 @@ class BaseTester(object):
 
                 for freq in frequencies:
                     if predict_last_n[freq] == 0:
-                        continue
-                    freq_key = "" if len(frequencies) == 1 else f"_{freq}"
+                        continue  # no predictions for this frequency
+                    freq_key = '' if len(frequencies) == 1 else f'_{freq}'
                     y_hat_sub, y_sub = self._subset_targets(model, data, predictions, predict_last_n[freq], freq_key)
-                    date_sub = data[f"date{freq_key}"][:, -predict_last_n[freq]:]
+                    # Date subsetting is universal across all models and thus happens here.
+                    date_sub = data[f'date{freq_key}'][:, -predict_last_n[freq]:]
 
                     if freq not in preds:
                         preds[freq] = y_hat_sub.detach().cpu()
@@ -584,38 +620,46 @@ class BaseTester(object):
                         obs[freq] = torch.cat((obs[freq], y_sub.detach().cpu()), 0)
                         dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
 
+                losses.append(loss)
+
             for freq in preds.keys():
                 preds[freq] = preds[freq].numpy()
                 obs[freq] = obs[freq].numpy()
 
+        # concatenate all output variables (currently a dict-of-dicts) into a single-level dict
         for key, list_of_data in all_output.items():
             all_output[key] = np.concatenate(list_of_data, 0)
 
+        # set to NaN explicitly if all losses are NaN to avoid RuntimeWarning
         mean_losses = {}
         if len(losses) == 0:
-            mean_losses["loss"] = np.nan
+            mean_losses['loss'] = np.nan
         else:
             for loss_name in losses[0].keys():
-                mean_losses[loss_name] = float(np.nanmean([d[loss_name] for d in losses]))
+                loss_values = [loss[loss_name] for loss in losses]
+                mean_losses[loss_name] = np.nanmean(loss_values) if not np.all(np.isnan(loss_values)) else np.nan
 
         return preds, obs, dates, mean_losses, all_output
 
     # ------------------------------------------------------------------
-    # Persistent eval that MATCHES your BaseTrainer flatten logic
-    # + CORRECT per-basin safety checks
-    # + CAUSAL warm-up in timesteps (with sequence-aligned saving)
+    # Persistent evaluation (manuscript Sec. 2.7): same flattening as in training, one continuous stream per basin
     # ------------------------------------------------------------------
     def _evaluate_persistent_match_training_with_flatten(
         self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
     ):
         """
-        Key corrections:
-          1) Safety check: ensure batch contains ONE basin (no leakage).
-          2) Warm-up is tracked in *timesteps* across the flattened stream.
-             - We run warmup steps causally, updating hidden but not saving outputs.
-             - To keep NH metrics pipeline consistent, we only *save* outputs aligned to full sequences.
-               If warm-up ends mid-sequence, we still warm-up exactly, but we drop the remaining partial
-               sequence tail until the next full-sequence boundary.
+        Per basin: chronological, time-contiguous batches are flattened exactly as in training and processed as one
+        continuous stream, carrying the detached (h, c) from batch to batch.
+
+          1) Safety check: each batch holds ONE basin (no state leakage across basins).
+          2) The stream starts from a zero state, or from a saved state (persistent_state_init_file) that ends exactly
+             one time step before the stream starts. The state is reset (and the reset counted) if the stream has a
+             time gap or the state becomes non-finite (e.g. after a NaN forcing value).
+          3) Causal warm-up: the first eval_warmup_steps time steps update the state but are not scored. With
+             eval_warmup_from_preceding_period these steps lie before the period start, so the whole period is scored.
+             Saved outputs stay aligned to full windows: if the warm-up ends inside a window, the rest of that window
+             is also run without being scored.
+          4) The evaluation loss is computed over every scored time step (all L steps of every scored window).
         """
         freq = frequencies[0]
         predict_last_n = self.cfg.predict_last_n
@@ -625,13 +669,35 @@ class BaseTester(object):
         preds, obs, dates, all_output = {}, {}, {}, {}
         losses = []
 
+        ablate_state_carry = bool(getattr(self.cfg, "ablate_state_carry", False))
         hidden = self._persistent_hidden_eval  # starts None per basin
+        last_end = self._persistent_state_end_eval
+        step = None
+
+        # Optional initial state saved at the end of a preceding period (e.g. validation -> test)
+        init_state = self._persistent_init_states.get(getattr(self, "_persistent_basin_eval", None), None)
+        initialized_from_file = False
 
         eval_warmup_steps = self._get_eval_warmup_steps()
         warmup_done_steps = 0  # timesteps consumed for warm-up (in flattened time)
+        n_gap_resets, n_nonfinite_resets = 0, 0
+
+        def _advance(new_pred, slice_end_date):
+            """Carry the detached final state of a forward pass; reset it if it is not finite."""
+            nonlocal hidden, last_end, n_nonfinite_resets
+            new_hidden = new_pred.get("hidden_state", None)
+            if new_hidden is None:
+                hidden = None
+            else:
+                h, c = new_hidden
+                hidden = (h.detach(), c.detach())
+                if not state_is_finite(hidden):
+                    hidden = None
+                    n_nonfinite_resets += 1
+            last_end = slice_end_date
 
         with torch.no_grad():
-            for data in loader:
+            for batch_number, data in enumerate(loader):
                 # move tensors
                 for key in data.keys():
                     if key.startswith("x_d"):
@@ -641,7 +707,7 @@ class BaseTester(object):
 
                 data = model.pre_model_hook(data, is_train=False)
 
-                # SAFETY: ensure one basin per batch (mirrors your BaseTrainer)
+                # SAFETY: ensure one basin per batch (mirrors BaseTrainer)
                 if "basin_idx" not in data or (not torch.is_tensor(data["basin_idx"])):
                     raise RuntimeError("Persistent eval requires basin_idx in batch.")
                 flat_b = data["basin_idx"].view(-1)
@@ -656,6 +722,35 @@ class BaseTester(object):
                     raise RuntimeError("Persistent eval: expected x_d tensors with shape [B, L, ...].")
 
                 B_inferred, L_inferred = int(any_xd.shape[0]), int(any_xd.shape[1])
+
+                batch_dates = np.asarray(data["date"])
+                if batch_dates.shape[:2] != (B_inferred, L_inferred):
+                    raise RuntimeError("Persistent eval: date array does not match x_d.")
+                flat_dates = batch_dates.reshape(-1)
+                if step is None:
+                    step = infer_time_step(batch_dates, freq)
+                if B_inferred > 1 and not np.all(batch_dates[1:, 0] == batch_dates[:-1, -1] + step):
+                    raise RuntimeError("Persistent eval: a batch holds windows that are not contiguous in time.")
+
+                # initial state of the stream: saved state if it ends exactly one step before the stream starts
+                if batch_number == 0 and init_state is not None:
+                    if np.datetime64(init_state["last_date"]) + step == flat_dates[0]:
+                        hidden = (torch.from_numpy(np.asarray(init_state["h"])).to(self.device),
+                                  torch.from_numpy(np.asarray(init_state["c"])).to(self.device))
+                        last_end = np.datetime64(init_state["last_date"])
+                        initialized_from_file = True
+                        eval_warmup_steps = 0  # the loaded state already summarizes the history
+                    else:
+                        LOGGER.warning(f"Basin {self._persistent_basin_eval}: saved state ends at "
+                                       f"{init_state['last_date']}, not one step before {flat_dates[0]}; "
+                                       f"starting from a zero state.")
+
+                # continuity: never carry a state across a time gap
+                if hidden is not None and last_end is not None and flat_dates[0] != last_end + step:
+                    hidden = None
+                    n_gap_resets += 1
+                if ablate_state_carry:
+                    hidden = None
 
                 # build flattened view (exactly like trainer)
                 reshaped: Dict[str, object] = {}
@@ -698,15 +793,7 @@ class BaseTester(object):
                 if warm_T > 0:
                     warm_seg = self._slice_time_segment(reshaped, slice(0, warm_T))
                     _fix_xs(warm_seg)
-
-                    warm_pred = model(warm_seg, hidden_state=hidden)
-                    new_hidden = warm_pred.get("hidden_state", None)
-                    if new_hidden is not None:
-                        h, c = new_hidden
-                        hidden = (h.detach(), c.detach())
-                    else:
-                        hidden = None
-
+                    _advance(model(warm_seg, hidden_state=hidden), flat_dates[warm_T - 1])
                     warmup_done_steps += warm_T
 
                     # If the whole batch was warm-up, continue
@@ -718,22 +805,16 @@ class BaseTester(object):
                 eval_T = seg_len - warm_T
                 eval_end = eval_start + eval_T
 
-                # IMPORTANT: To keep NH metrics pipeline consistent, we only save on full-sequence boundaries.
-                # If eval_start is not aligned to L, drop the initial partial (we already warmed it causally).
+                # Saved outputs stay aligned to full windows: if eval_start is not aligned to L, run the rest of that
+                # window forward (causally, updating the state) without scoring it.
                 misalign = eval_start % L_inferred
                 if misalign != 0:
                     drop = L_inferred - misalign
-                    # run forward on the dropped part to keep hidden correct (already causal)
-                    drop_seg = self._slice_time_segment(reshaped, slice(eval_start, min(eval_end, eval_start + drop)))
+                    drop_end = min(eval_end, eval_start + drop)
+                    drop_seg = self._slice_time_segment(reshaped, slice(eval_start, drop_end))
                     _fix_xs(drop_seg)
-                    drop_pred = model(drop_seg, hidden_state=hidden)
-                    new_hidden = drop_pred.get("hidden_state", None)
-                    if new_hidden is not None:
-                        h, c = new_hidden
-                        hidden = (h.detach(), c.detach())
-                    else:
-                        hidden = None
-                    eval_start = min(eval_end, eval_start + drop)
+                    _advance(model(drop_seg, hidden_state=hidden), flat_dates[drop_end - 1])
+                    eval_start = drop_end
                     eval_T = eval_end - eval_start
                     if eval_T <= 0:
                         continue
@@ -744,19 +825,9 @@ class BaseTester(object):
                 pred = model(eval_seg, hidden_state=hidden)
 
                 # update hidden after eval part
-                new_hidden = pred.get("hidden_state", None)
-                if new_hidden is not None:
-                    h, c = new_hidden
-                    hidden = (h.detach(), c.detach())
-                else:
-                    hidden = None
+                _advance(pred, flat_dates[eval_end - 1])
 
-                # compute losses on eval part only
-                _, all_losses = self.loss_obj(pred, eval_seg)
-                losses.append({k: float(v.detach().cpu().item()) for k, v in all_losses.items()})
-
-                # Rebuild predictions to [Nseq, L, ...]
-                # eval_T is aligned to L now
+                # Rebuild predictions to [Nseq, L, ...] (eval_T is aligned to L here)
                 eval_seqs = eval_T // L_inferred
 
                 full_predictions: Dict[str, torch.Tensor] = {}
@@ -768,9 +839,7 @@ class BaseTester(object):
                     if v.dim() >= 2 and v.shape[0] == 1 and v.shape[1] == eval_T:
                         full_predictions[k] = v.reshape(eval_seqs, L_inferred, *v.shape[2:])
 
-                # Now we must slice original (unflattened) data to match what we saved.
-                # Saved sequences correspond to the LAST `eval_seqs` sequences in this batch after dropping warm+misalign.
-                # Convert eval_start (in timesteps) into how many full sequences were dropped from the front.
+                # Slice the original (unflattened) data to the scored windows: the LAST eval_seqs windows of the batch.
                 dropped_full_seqs = eval_start // L_inferred
                 if dropped_full_seqs > 0:
                     data_kept: Dict[str, object] = {}
@@ -788,6 +857,10 @@ class BaseTester(object):
                             data_kept[k] = v
                 else:
                     data_kept = data
+
+                # evaluation loss over every scored time step (all L steps of each scored window)
+                _, all_losses = self.loss_obj(full_predictions, data_kept)
+                losses.append({k: float(v.detach().cpu().item()) for k, v in all_losses.items()})
 
                 # Optional save_all_output (only eval part)
                 if save_all_output:
@@ -813,6 +886,11 @@ class BaseTester(object):
                         dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
 
         self._persistent_hidden_eval = hidden
+        self._persistent_state_end_eval = last_end
+
+        if n_gap_resets or n_nonfinite_resets:
+            LOGGER.warning(f"Basin {getattr(self, '_persistent_basin_eval', '?')}: {n_gap_resets} state resets at "
+                           f"time gaps, {n_nonfinite_resets} resets after non-finite states (e.g. NaN forcing).")
 
         for f in preds.keys():
             preds[f] = preds[f].numpy()
@@ -827,9 +905,36 @@ class BaseTester(object):
             mean_losses["loss"] = np.nan
         else:
             for k in losses[0].keys():
-                mean_losses[k] = float(np.nanmean([d[k] for d in losses]))
+                values = [d[k] for d in losses]
+                mean_losses[k] = float(np.nanmean(values)) if not np.all(np.isnan(values)) else np.nan
 
         return preds, obs, dates, mean_losses, all_output
+
+    # ------------------------------------------------------------------
+    # Saving / loading final persistent states (operational initialization, manuscript Sec. 1)
+    # ------------------------------------------------------------------
+    def _persistent_states_file(self, epoch: Optional[int]) -> Path:
+        if epoch is None:
+            stem = self._get_weight_file(epoch=None).stem
+        else:
+            stem = f"model_epoch{str(epoch).zfill(3)}"
+        return self.run_dir / self.period / stem / f"{self.period}_persistent_states.p"
+
+    def _save_persistent_states(self, states: Dict[str, dict], epoch: Optional[int] = None):
+        """Write {basin: {'h', 'c', 'last_date'}} (numpy arrays) for later initialization of a following period."""
+        state_file = self._persistent_states_file(epoch)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with state_file.open("wb") as fp:
+            pickle.dump({"period": self.period, "states": states}, fp)
+        LOGGER.info(f"Stored final persistent states of {len(states)} basins at {state_file}")
+
+    @staticmethod
+    def _load_persistent_states(state_file: Path) -> Dict[str, dict]:
+        with Path(state_file).open("rb") as fp:
+            content = pickle.load(fp)
+        states = content["states"] if isinstance(content, dict) and "states" in content else content
+        LOGGER.info(f"Loaded initial persistent states of {len(states)} basins from {state_file}")
+        return states
 
     # ------------------------------------------------------------------
     # misc

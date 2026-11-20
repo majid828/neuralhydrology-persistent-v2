@@ -22,60 +22,35 @@ from neuralhydrology.training.earlystopper import EarlyStopper
 from neuralhydrology.training.logger import Logger
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.logging_utils import setup_logging
+from neuralhydrology.utils.persistentutils import (contiguous_batches, has_finite_targets, infer_time_step,
+                                                   unflatten_predictions, validate_persistent_config)
 
 LOGGER = logging.getLogger(__name__)
 
 
 # =============================================================================
-# FIXED: Basin Chrono Interleave Batch Sampler
+# Basin-chronological, interleaved batch sampler for persistent-state training
 # =============================================================================
 class BasinChronoInterleaveBatchSampler(Sampler[List[int]]):
-    """
-   
+    """Yields mini-batches for persistent-state training (manuscript Sec. 2.5, Algorithm 1 step 3).
 
-    
-      - Within each basin: batches are always chronological (never A2(second batch of a basin) before A1(first batch of a basin)).
-      - Across basins: we still "shuffle" by randomly interleaving basins
-        (A1, C1, B1, A2, D1, B2, ...).
-
-    Why this is necessary:
-      Persistent LSTM carries (h,c) forward in time. If you shuffle all batch-units
-      globally, you can accidentally process a later time-chunk before an earlier one
-      for the same basin -> hidden-state time misalignment -> training collapses / bad NSE.
-
-    How it works:
-      - We precompute, for each basin, the chronological list of dataset indices.
-      - We keep a per-basin pointer `ptr[basin]` indicating which batch number comes next.
-      - At each step we randomly choose a basin from the still-active basins and yield its NEXT batch.
+    - Every batch holds consecutive, time-contiguous segments of ONE basin, so that flattening the batch gives one
+      continuous stream (Sec. 2.3). The batches are built by `persistentutils.contiguous_batches`.
+    - Within a basin, batches are always yielded in chronological order (A1 before A2 before A3, Eq. 15).
+    - Across basins, the order is re-randomized every epoch by randomly interleaving basins (A1, C1, B1, A2, ..., Eq. 16).
+    - Every batch is used exactly once per epoch. Only the last batch of a contiguous run of segments can hold fewer
+      than batch_size segments; no full segment is dropped (Sec. 2.2).
     """
 
-    def __init__(
-        self,
-        basin_to_sorted_indices: Dict[int, List[int]],
-        batch_size: int,
-        drop_last: bool = True,
-        seed: int = 0,
-    ):
-        self.basin_to_sorted_indices = basin_to_sorted_indices
-        self.batch_size = int(batch_size)
-        self.drop_last = bool(drop_last)
+    def __init__(self, basin_to_batches: Dict[int, List[List[int]]], seed: int = 0):
+        self.basin_to_batches = {b: [list(batch) for batch in batches]
+                                 for b, batches in basin_to_batches.items() if len(batches) > 0}
         self.seed = int(seed)
         self._epoch = 0
-
-        # Precompute how many batches each basin contributes.
-        self._basin_num_batches: Dict[int, int] = {}
-        for basin_id, idxs in self.basin_to_sorted_indices.items():
-            n = len(idxs)
-            if self.drop_last:
-                nb = n // self.batch_size
-            else:
-                nb = (n + self.batch_size - 1) // self.batch_size
-            self._basin_num_batches[basin_id] = nb
-
-        self._length = sum(self._basin_num_batches.values())
+        self._length = sum(len(batches) for batches in self.basin_to_batches.values())
 
     def set_epoch(self, epoch: int):
-        """Call this once per epoch so interleaving changes deterministically."""
+        """Call once per epoch so that the interleaving changes (deterministically, given the seed)."""
         self._epoch = int(epoch)
 
     def __len__(self) -> int:
@@ -83,34 +58,14 @@ class BasinChronoInterleaveBatchSampler(Sampler[List[int]]):
 
     def __iter__(self) -> Iterator[List[int]]:
         rng = random.Random(self.seed + self._epoch)
-
-        # Pointer to "next chronological batch" per basin
-        ptr: Dict[int, int] = {b: 0 for b in self._basin_num_batches.keys()}
-
-        # Only basins with at least one batch
-        active = [b for b, nb in self._basin_num_batches.items() if nb > 0]
-
+        # pointer to the next chronological batch of each basin
+        ptr: Dict[int, int] = {b: 0 for b in self.basin_to_batches}
+        active = sorted(self.basin_to_batches)
         while active:
             basin_id = rng.choice(active)
-
-            k = ptr[basin_id]  # batch number within this basin
-            start = k * self.batch_size
-            end = start + self.batch_size
-
-            idxs = self.basin_to_sorted_indices[basin_id]
-            batch = idxs[start:end]
-
-            # Safety (should not happen for drop_last=True)
-            if self.drop_last and len(batch) < self.batch_size:
-                ptr[basin_id] += 1
-                if ptr[basin_id] >= self._basin_num_batches[basin_id]:
-                    active.remove(basin_id)
-                continue
-
-            yield batch
-
+            yield self.basin_to_batches[basin_id][ptr[basin_id]]
             ptr[basin_id] += 1
-            if ptr[basin_id] >= self._basin_num_batches[basin_id]:
+            if ptr[basin_id] >= len(self.basin_to_batches[basin_id]):
                 active.remove(basin_id)
 
 
@@ -140,13 +95,10 @@ class BaseTrainer(object):
         self._patience_dynamic_learning_rate = cfg.patience_dynamic_learning_rate
         self._factor_dynamic_learning_rate = cfg.factor_dynamic_learning_rate
 
-        # Persistent LSTM flag (your control switch)
+        # Persistent-state training switch. Invalid persistent settings raise here, before any run folder is created.
+        validate_persistent_config(self.cfg)
         self.persistent_state = getattr(self.cfg, "persistent_state", False)
-
-        # NOTE: we do NOT want persistence across epochs anymore.
-        # These are kept only so older configs won't crash, but they are NOT used here.
-        self.persist_state_across_epochs = getattr(self.cfg, "persist_state_across_epochs", False)
-        self.shuffle_basins_each_epoch = getattr(self.cfg, "shuffle_basins_each_epoch", False)
+        self._persistent_time_step: Optional[np.timedelta64] = None
 
         # Basin list
         self.basins = load_basin_file(cfg.train_basin_file)
@@ -233,21 +185,19 @@ class BaseTrainer(object):
         return get_tester(cfg=self.cfg, run_dir=self.cfg.run_dir, period="validation", init_model=False)
 
     # ------------------------------------------------------------------
-    # Build basin->chronological indices from the dataset
+    # Build basin -> chronological, time-contiguous batches from the dataset
     # ------------------------------------------------------------------
-    def _build_basin_chrono_index(self, ds: BaseDataset) -> Dict[int, List[int]]:
-        """
-        Build mapping:
-            basin_id (int) -> list of dataset indices sorted by start date.
+    def _build_basin_chrono_batches(self, ds: BaseDataset) -> Dict[int, List[List[int]]]:
+        """Map basin_id -> list of batches (lists of dataset indices) in chronological order.
 
-        This is used by BasinChronoInterleaveBatchSampler so that:
-            basin A always yields A1, A2, A3... (chronological)
-            (it should not came in random order like A3, A1, A2...)
-        even while basins are interleaved in random order.
+        Each batch holds up to batch_size consecutive segments of one basin that are contiguous in time, so the
+        flattened batch is one continuous stream. A data gap (segments removed because of missing forcing) ends a
+        batch; the trainer then starts the next batch of that basin from a fresh state instead of carrying the state
+        across the gap.
         """
-        basin_to_items: Dict[int, List[Tuple[int, Any]]] = {}
-        LOGGER.info("### Building basin chronological index (one pass over dataset) ...")
-
+        LOGGER.info("### Building chronological, time-contiguous batches per basin (one pass over dataset) ...")
+        basin_to_items: Dict[int, List[Tuple[int, Any, Any]]] = {}
+        step = None
         for idx in range(len(ds)):
             sample = ds[idx]
 
@@ -259,24 +209,24 @@ class BaseTrainer(object):
             else:
                 basin_id = int(np.array(bidx).reshape(-1)[0])
 
-            # Prefer actual date if present
-            if "date" in sample:
-                d = sample["date"]
-                d_np = np.array(d)
-                start_time = d_np.reshape(-1)[0] if d_np.ndim >= 1 else d_np
-            else:
-                # Fallback: dataset order (still deterministic, but less robust)
-                start_time = idx
+            if "date" not in sample:
+                raise RuntimeError("Dataset sample does not contain 'date'. Required to order segments in time.")
+            dates = np.asarray(sample["date"]).reshape(-1)
+            if step is None:
+                step = infer_time_step(dates[None, :], ds.frequencies[0] if ds.frequencies else None)
 
-            basin_to_items.setdefault(basin_id, []).append((idx, start_time))
+            basin_to_items.setdefault(basin_id, []).append((idx, dates[0], dates[-1]))
 
-        basin_to_sorted_indices: Dict[int, List[int]] = {}
-        for basin_id, items in basin_to_items.items():
-            items_sorted = sorted(items, key=lambda x: x[1])
-            basin_to_sorted_indices[basin_id] = [i for i, _ in items_sorted]
-
-        LOGGER.info(f"### Built chrono index for {len(basin_to_sorted_indices)} basins.")
-        return basin_to_sorted_indices
+        self._persistent_time_step = step
+        basin_to_batches = {
+            basin_id: contiguous_batches(items, batch_size=self.cfg.batch_size, step=step)
+            for basin_id, items in basin_to_items.items()
+        }
+        n_segments = sum(len(items) for items in basin_to_items.values())
+        n_batches = sum(len(batches) for batches in basin_to_batches.values())
+        LOGGER.info(f"### {n_segments} segments of {len(basin_to_items)} basins grouped into {n_batches} "
+                    f"time-contiguous batches.")
+        return basin_to_batches
 
     def initialize_training(self):
         """Initialize the training class."""
@@ -291,14 +241,11 @@ class BaseTrainer(object):
         # CORRECT persistent batching
         # ------------------------------------------------------------------
         if self.persistent_state and self.cfg.model.lower() == "persistentlstm":
-            # NOTE: we deliberately DO NOT use any "persist across epochs" file saving here.
-            # We only ensure: persistent across batches within epoch + random interleaving of basins.
-            basin_to_sorted_indices = self._build_basin_chrono_index(ds)
+            # Persistent across batches of the same basin within an epoch, random interleaving of basins.
+            basin_to_batches = self._build_basin_chrono_batches(ds)
 
             self._basin_batch_sampler = BasinChronoInterleaveBatchSampler(
-                basin_to_sorted_indices=basin_to_sorted_indices,
-                batch_size=self.cfg.batch_size,
-                drop_last=True,
+                basin_to_batches=basin_to_batches,
                 seed=self.cfg.seed if self.cfg.seed is not None else 0,
             )
 
@@ -467,16 +414,39 @@ class BaseTrainer(object):
         optimizer_path = self.cfg.run_dir / f"optimizer_state_epoch{epoch:03d}.pt"
         torch.save(self.optimizer.state_dict(), str(optimizer_path))
 
+    @staticmethod
+    def _cache_persistent_state(cache: Dict[int, Optional[Tuple[torch.Tensor, torch.Tensor]]],
+                                cache_end: Dict[int, Any], basin_id: int,
+                                new_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]], dates: np.ndarray):
+        """C[b] <- detach(h_T, c_T) (manuscript Eq. 13), plus the time stamp of the last processed step."""
+        if new_hidden is None:
+            cache[basin_id] = None
+        else:
+            h, c = new_hidden
+            cache[basin_id] = (h.detach(), c.detach())
+        cache_end[basin_id] = np.asarray(dates)[-1, -1]
+
+    def _add_target_noise(self, data: Dict[str, torch.Tensor]):
+        if self.noise_sampler_y is not None:
+            for key in filter(lambda k: 'y' in k, data.keys()):
+                noise = self.noise_sampler_y.sample(data[key].shape)
+                # make sure we add near-zero noise to originally near-zero targets
+                data[key] += (data[key] + self._target_mean / self._target_std) * noise.to(self.device)
+
     def _train_epoch(self, epoch: int):
         self.model.train()
         self.experiment_logger.train()
 
         # ============================================================
-        # Persistent path: persist across batches of same basin within epoch only
+        # Persistent-state path (manuscript Algorithm 1)
         # ============================================================
         if self.persistent_state and self.cfg.model.lower() == "persistentlstm":
-            # Reset all basin states at epoch start (NO cross-epoch persistence)
+            # Algorithm 1 step 2 / Eq. (14): empty state cache at the start of every epoch (no carry across epochs)
             epoch_state_cache: Dict[int, Optional[Tuple[torch.Tensor, torch.Tensor]]] = {}
+            epoch_state_end: Dict[int, Any] = {}
+            ablate_state_carry = bool(getattr(self.cfg, "ablate_state_carry", False))
+            step = self._persistent_time_step
+            n_updates, n_no_target, n_gap_resets = 0, 0, 0
 
             n_iter = min(self._max_updates_per_epoch, len(self.loader)) if self._max_updates_per_epoch is not None else None
             pbar = tqdm(self.loader, file=sys.stdout, disable=self._disable_pbar, total=n_iter)
@@ -511,9 +481,6 @@ class BaseTrainer(object):
                 # Extract basin id
                 basin_id = int(flat[0].item())
 
-                # Load basin hidden state (None if first time this epoch)
-                hidden = epoch_state_cache.get(basin_id, None)
-
                 # Infer B,L from any dynamic input
                 any_xd = None
                 if "x_d" in data and isinstance(data["x_d"], dict) and len(data["x_d"]) > 0:
@@ -522,7 +489,26 @@ class BaseTrainer(object):
                     raise RuntimeError("Persistent training: could not infer [B,L] from x_d.")
                 B_inferred, L_inferred = int(any_xd.shape[0]), int(any_xd.shape[1])
 
-                # Flatten to batch=1 so the model sees one continuous segment
+                # Time stamps of the B consecutive segments, shape [B, L]
+                dates = np.asarray(data["date"])
+                if dates.shape[:2] != (B_inferred, L_inferred):
+                    raise RuntimeError(f"Persistent training: date array {dates.shape} does not match x_d "
+                                       f"[{B_inferred}, {L_inferred}].")
+                # The sampler only groups time-contiguous segments, so the flattened stream is continuous (Sec. 2.3).
+                if B_inferred > 1 and not np.all(dates[1:, 0] == dates[:-1, -1] + step):
+                    raise RuntimeError("Persistent training: a batch holds segments that are not contiguous in time.")
+
+                # Eq. (11): cached state of this basin, or init() (= zero state) if there is none. The cached state is
+                # only used if it ended exactly one time step before this batch starts; after a data gap (segments
+                # removed because of missing forcing) the basin restarts from init() instead of jumping the gap.
+                hidden = epoch_state_cache.get(basin_id, None)
+                if hidden is not None and dates[0, 0] != epoch_state_end[basin_id] + step:
+                    hidden = None
+                    n_gap_resets += 1
+                if ablate_state_carry:
+                    hidden = None
+
+                # Flatten [B, L, ...] -> [1, B*L, ...] so the model sees one continuous segment (Eq. 7-8)
                 reshaped: Dict[str, object] = {}
                 for key, val in data.items():
                     if key.startswith("x_d"):
@@ -547,35 +533,43 @@ class BaseTrainer(object):
                 seg_len = B_inferred * L_inferred
                 seg_data = self._slice_time_segment(reshaped, slice(0, seg_len))
 
-                # Fix x_s to batch=1 (static features should be per-basin, not per-time)
+                # Eq. (9): reattach the basin's static attributes (batch=1; static features are per basin, not per time)
                 if "x_s" in data:
                     if isinstance(data["x_s"], dict):
                         seg_data["x_s"] = {feat: v[0:1, ...] for feat, v in data["x_s"].items()}
                     else:
                         seg_data["x_s"] = data["x_s"][0:1, ...]
 
-                # Forward with carried hidden state
+                # Eq. (12): forward pass over the flattened stream, starting from (h0, c0)
                 preds = self.model(seg_data, hidden_state=hidden)
-
-                # Update basin hidden state (ONLY within this epoch)
                 new_hidden = preds.get("hidden_state", None)
-                if new_hidden is not None:
-                    h, c = new_hidden
-                    epoch_state_cache[basin_id] = (h.detach(), c.detach())
-                else:
-                    epoch_state_cache[basin_id] = None
 
-                # Loss
-                loss_val, all_losses = self.loss_obj(preds, seg_data)
+                # A batch without any observed target (e.g. a gap in the discharge record) carries no supervision:
+                # propagate the state through it, but do not update the parameters.
+                if not has_finite_targets(data):
+                    self._cache_persistent_state(epoch_state_cache, epoch_state_end, basin_id, new_hidden, dates)
+                    n_no_target += 1
+                    continue
+
+                self._add_target_noise(data)
+
+                # Eq. (17)/(20): loss over EVERY valid time step of the flattened segment T = B*L. The predictions are
+                # mapped back to [B, L, ...] and scored against the original [B, L, ...] targets; with
+                # predict_last_n == seq_length (enforced by validate_persistent_config) BaseLoss keeps all L steps of
+                # each of the B segments. (Scoring the flattened [1, B*L] tensors would keep only the last L steps.)
+                preds_for_loss = unflatten_predictions(preds, B_inferred, L_inferred)
+                loss_val, all_losses = self.loss_obj(preds_for_loss, data)
 
                 if torch.isnan(loss_val):
                     nan_count += 1
                     if nan_count > self._allow_subsequent_nan_losses:
                         raise RuntimeError(f"Loss was NaN for {nan_count} times in a row. Stopped training.")
                     LOGGER.warning(f"Loss is NaN; ignoring step. (#{nan_count}/{self._allow_subsequent_nan_losses})")
+                    self._cache_persistent_state(epoch_state_cache, epoch_state_end, basin_id, new_hidden, dates)
                     continue
                 nan_count = 0
 
+                # Algorithm 1 step 15: update the parameters by backpropagation through the current segment only
                 self.optimizer.zero_grad()
                 loss_val.backward()
 
@@ -583,14 +577,21 @@ class BaseTrainer(object):
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_gradient_norm)
 
                 self.optimizer.step()
+                n_updates += 1
+
+                # Eq. (13), Algorithm 1 step 16: after the optimizer update, store the detached final state.
+                # Detaching stops gradients at the batch boundary (truncated BPTT); the values are carried forward.
+                self._cache_persistent_state(epoch_state_cache, epoch_state_end, basin_id, new_hidden, dates)
 
                 pbar.set_postfix_str(f"Loss: {loss_val.item():.4f}")
                 self.experiment_logger.log_step(**{k: v.item() for k, v in all_losses.items()})
 
+            LOGGER.info(f"Epoch {epoch}: {n_updates} optimizer updates; {n_no_target} batches without observed "
+                        f"targets (state propagated, no update); {n_gap_resets} state resets at data gaps.")
             return
 
         # ============================================================
-        # Original non-persistent path (unchanged)
+        # Original non-persistent path (as in upstream NeuralHydrology)
         # ============================================================
         n_iter = min(self._max_updates_per_epoch, len(self.loader)) if self._max_updates_per_epoch is not None else None
         pbar = tqdm(self.loader, file=sys.stdout, disable=self._disable_pbar, total=n_iter)
@@ -607,11 +608,17 @@ class BaseTrainer(object):
                 elif not key.startswith("date"):
                     data[key] = data[key].to(self.device)
 
+            # apply possible pre-processing to the batch before the forward pass
             data = self.model.pre_model_hook(data, is_train=True)
 
+            # get predictions
             predictions = self.model(data)
+
+            self._add_target_noise(data)
+
             loss_val, all_losses = self.loss_obj(predictions, data)
 
+            # early stop training if loss is NaN
             if torch.isnan(loss_val):
                 nan_count += 1
                 if nan_count > self._allow_subsequent_nan_losses:

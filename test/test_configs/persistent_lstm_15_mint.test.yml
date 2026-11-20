@@ -16,6 +16,8 @@
   data_dir: /mnt/disk1/CAMELS_US
   forcings: nldas_hourly
   qobs_15min_dir: /mnt/disk1/CAMELS_US/15min
+  # USGS RDB time stamps are local clock time (tz_cd); convert to UTC to match the NLDAS forcings
+  qobs_15min_to_utc: true
   use_frequencies:
     - 15min
 
@@ -35,6 +37,8 @@
   non_overlapping_sequences: true
   seq_stride: 24
   eval_warmup_steps: 2880
+  # warm-up spins up the state on the forcing BEFORE the period start, so the whole period is scored
+  eval_warmup_from_preceding_period: true
 
   dynamic_inputs:
     - convective_fraction

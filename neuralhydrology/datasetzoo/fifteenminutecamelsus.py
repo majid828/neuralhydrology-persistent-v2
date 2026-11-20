@@ -131,7 +131,7 @@ class FifteenMinuteCamelsUS(camelsus.CamelsUS):
 
         # Load TRUE 15-min discharge from RDB
         q15_dir = Path(getattr(self.cfg, "qobs_15min_dir", "/mnt/disk1/CAMELS_US/15min"))
-        q15 = load_15min_us_discharge(q15_dir, basin)
+        q15 = load_15min_us_discharge(q15_dir, basin, to_utc=getattr(self.cfg, "qobs_15min_to_utc", True))
 
         # LEFT JOIN to keep forcing timeline (avoid irregular index)
         df = df.join(q15, how="left")
@@ -173,8 +173,26 @@ class FifteenMinuteCamelsUS(camelsus.CamelsUS):
 # ==========================================================
 # 15-min USGS QObs loader (RDB)
 # ==========================================================
-def load_15min_us_discharge(data_dir_15min: Path, basin: str) -> pd.DataFrame:
+# UTC offsets (hours) of the time-zone codes used in USGS NWIS RDB files ('tz_cd' column)
+USGS_TZ_UTC_OFFSET_HOURS = {
+    "UTC": 0, "GMT": 0,
+    "EST": -5, "EDT": -4,
+    "CST": -6, "CDT": -5,
+    "MST": -7, "MDT": -6,
+    "PST": -8, "PDT": -7,
+    "AKST": -9, "AKDT": -8,
+    "HST": -10, "HDT": -9,
+    "AST": -4, "ADT": -3,
+}
+
+
+def load_15min_us_discharge(data_dir_15min: Path, basin: str, to_utc: bool = True) -> pd.DataFrame:
     """Load 15-min USGS discharge (parameter 00060) from .rdb files.
+
+    USGS RDB files give 'datetime' in local clock time and the time zone in 'tz_cd'. With `to_utc=True` (default),
+    every time stamp is converted to UTC with its own 'tz_cd', so that the discharge lines up with the UTC forcings
+    and daylight-saving changes no longer create duplicated or missing quarter-hours. Rows with an unknown time-zone
+    code are dropped (with a warning). If a file has no 'tz_cd' column, its time stamps are used as they are.
 
     Returns a DataFrame indexed by datetime (name='date') with one column:
       - qobs_cfs
@@ -206,9 +224,26 @@ def load_15min_us_discharge(data_dir_15min: Path, basin: str) -> pd.DataFrame:
             continue
         discharge_col = discharge_cols[0]
 
-        df = df[["datetime", discharge_col]].copy()
+        has_tz = "tz_cd" in df.columns
+        df = df[["datetime", discharge_col] + (["tz_cd"] if has_tz else [])].copy()
         df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
         df = df.dropna(subset=["datetime"])
+
+        if to_utc:
+            if has_tz:
+                offset_hours = df["tz_cd"].astype(str).str.strip().map(USGS_TZ_UTC_OFFSET_HOURS)
+                unknown = offset_hours.isna()
+                if unknown.any():
+                    codes = sorted(df.loc[unknown, "tz_cd"].astype(str).unique().tolist())
+                    LOGGER.warning(f"Basin {basin}, {fp.name}: dropping {int(unknown.sum())} rows with unknown "
+                                   f"time-zone codes {codes}.")
+                df = df.loc[~unknown].copy()
+                # local clock time - UTC offset = UTC (e.g. 00:00 PST - (-8 h) = 08:00 UTC)
+                df["datetime"] = df["datetime"] - pd.to_timedelta(offset_hours[~unknown].astype(float), unit="h")
+            else:
+                LOGGER.warning(f"Basin {basin}, {fp.name}: no 'tz_cd' column; time stamps are used as given.")
+        if has_tz:
+            df = df.drop(columns=["tz_cd"])
 
         df[discharge_col] = pd.to_numeric(df[discharge_col], errors="coerce")
 
