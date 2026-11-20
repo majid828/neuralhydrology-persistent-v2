@@ -43,12 +43,12 @@ learning_rate:
   0: 1e-3
   10: 5e-4
   20: 1e-4
-batch_size: 64
-epochs: 30
+batch_size: 256
+epochs: 1
 clip_gradient_norm: 1
 
 predict_last_n: 1
-seq_length: 336
+seq_length: 30
 
 num_workers: 0
 log_interval: 5
@@ -58,14 +58,12 @@ save_weights_every: 1
 save_validation_results: False
 
 # --- Data configurations --------------------------------------------------------------------------
-dataset: hourly_camels_us # will be filled by conftest
-data_dir: ./test/test_data/camels_us
-forcings: nldas_hourly # will be filled by conftest
+dataset: # will be filled by conftest
+data_dir: ./test/test_data
+forcings: # will be filled by conftest
 dynamic_inputs: # will be filled by conftest
-  - total_precipitation
-  - temperature
 target_variables:
-  - qobs_mm_per_hour
-static_attributes:            
+  - QObs(mm/d)
+static_attributes:
   - elev_mean
   - slope_mean
