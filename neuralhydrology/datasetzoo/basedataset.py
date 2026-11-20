@@ -21,6 +21,7 @@ from neuralhydrology.datautils import utils
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.errors import NoTrainDataError, NoEvaluationDataError
 from neuralhydrology.utils import samplingutils
+from neuralhydrology.utils.persistentutils import select_window_ends, uses_persistent_state
 
 LOGGER = logging.getLogger(__name__)
 
@@ -120,6 +121,16 @@ class BaseDataset(Dataset):
         # ------------------------------------------------------------------
         self.seq_stride = getattr(cfg, "seq_stride", 1)
         self.non_overlapping_sequences = getattr(cfg, "non_overlapping_sequences", False)
+        # Persistent-state training keeps windows whose targets are all missing (only inputs are validated), so that
+        # the recurrent state is propagated through target gaps instead of jumping over them. The masked loss ignores
+        # the missing targets (manuscript Sec. 2.6).
+        self._persistent_training = self.is_train and uses_persistent_state(cfg)
+        # Persistent-state evaluation can take its warm-up from the forcing preceding the period start, so that the
+        # whole evaluation period is scored (manuscript Sec. 2.7, 2.9).
+        self._eval_warmup_steps_before_start = 0
+        if (not self.is_train) and uses_persistent_state(cfg) and getattr(cfg, "eval_warmup_from_preceding_period",
+                                                                           False):
+            self._eval_warmup_steps_before_start = int(getattr(cfg, "eval_warmup_steps", 0))
 
         # during training we log data processing with progress bars, but not during validation/testing
         self._disable_pbar = cfg.verbose == 0 or not self.is_train
@@ -438,6 +449,11 @@ class BaseDataset(Dataset):
                 # compare offsets, they need to be anchored to a specific date (here, the start date).
                 offsets = [(self.seq_len[i] - self._predict_last_n[i]) * to_offset(freq)
                            for i, freq in enumerate(self.frequencies)]
+                # persistent-state evaluation: additional warm-up taken from the forcing before the period start
+                # (targets before the start date are set to NaN below, so no observation of that time is used).
+                if self._eval_warmup_steps_before_start > 0:
+                    offsets = [offset + self._eval_warmup_steps_before_start * to_offset(freq)
+                               for offset, freq in zip(offsets, self.frequencies)]
 
                 basin_data_list = []
                 # create xarray data set for each period slice of the specific basin
@@ -637,7 +653,8 @@ class BaseDataset(Dataset):
                     x_d_validate = None
                 flag = _validate_samples(x_d=x_d_validate,
                                         x_s=[x_s[freq] for freq in self.frequencies] if self.is_train and x_s else None,
-                                        y=[y[freq] for freq in self.frequencies] if self.is_train else None,
+                                        y=[y[freq] for freq in self.frequencies]
+                                        if self.is_train and not self._persistent_training else None,
                                         frequency_maps=[frequency_maps[freq] for freq in self.frequencies],
                                         seq_length=self.seq_len,
                                         predict_last_n=self._predict_last_n)
@@ -655,22 +672,20 @@ class BaseDataset(Dataset):
             # indices (in lowest-frequency steps) where the sample is valid
             valid_samples = np.argwhere(flag == 1).flatten()
 
-            # --------------------------------------------------------------
-            # Optional thinning / non-overlapping sampling
-            # For persistent LSTM (single frequency) we typically want stride
-            # >= seq_len[0] so that windows do not overlap in time.
-            # --------------------------------------------------------------
             if self.non_overlapping_sequences:
+                # Non-overlapping chronological segments on a FIXED grid (manuscript Eq. 4-6): segment k ends at
+                # index k*L - 1. Invalid windows are left out without shifting the grid, so consecutive kept windows
+                # are either adjacent in time or separated by a visible gap (which the persistent trainer detects).
                 if len(self.frequencies) != 1:
                     raise ValueError(
                         "non_overlapping_sequences is currently only supported for single-frequency datasets.")
                 stride = int(self.seq_stride)
                 if stride <= 0:
                     raise ValueError("seq_stride must be a positive integer.")
-                # If user left seq_stride=1, default to full sequence length for non-overlapping windows
-                if stride == 1:
-                    stride = int(self.seq_len[0])
-                valid_samples = valid_samples[::stride]
+                valid_samples = select_window_ends(flag, seq_len=int(self.seq_len[0]), stride=stride)
+                # a basin without a single finite training target contributes no supervision: skip it
+                if self._persistent_training and not np.any(np.isfinite(y[self.frequencies[0]])):
+                    valid_samples = valid_samples[:0]
             elif self.seq_stride > 1:
                 stride = int(self.seq_stride)
                 if stride <= 0:
@@ -680,11 +695,6 @@ class BaseDataset(Dataset):
             # store pointer to basin and the sample's index in each frequency
             for f in valid_samples:
                 lookup.append((basin, [frequency_maps[freq][int(f)] for freq in self.frequencies]))
-
-            #valid_samples = np.argwhere(flag == 1)
-            #for f in valid_samples:
-                # store pointer to basin and the sample's index in each frequency
-               # lookup.append((basin, [frequency_maps[freq][int(f)] for freq in self.frequencies]))
 
             # only store data if this basin has at least one valid sample in the given period
             if valid_samples.size > 0:

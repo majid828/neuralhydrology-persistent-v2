@@ -20,9 +20,12 @@ class PersistentLSTMModel(BaseModel):
       and don't pass `hidden_state`, it behaves like a normal CudaLSTM-style
       sequence model.
 
-    Assumptions for your current use:
-    - Single frequency (len(cfg.use_frequencies) == 1).
-    - No static attributes are used (so InputLayer only builds dynamic inputs).
+    Assumptions:
+    - Single frequency (persistent-state runs are validated by utils.persistentutils.validate_persistent_config).
+    - Static attributes, if configured, are concatenated to the dynamic inputs at every time step by the
+      InputLayer, exactly as in CudaLSTM. In persistent training the basin's static vector is reattached after
+      flattening (manuscript Eq. 9).
+    - `hidden_state=None` starts from PyTorch's default zero state (init() in manuscript Eq. 11).
     """
 
     # Parts that can be finetuned (same pattern as CudaLSTM)
@@ -47,8 +50,8 @@ class PersistentLSTMModel(BaseModel):
         # Optional forget-gate bias initialisation (NH style)
         self._reset_parameters()
 
-        # Whether trainer is *supposed* to keep state between segments/batches
-        # (the actual logic lives in BaseTrainer / tester.py)
+        # Whether the trainer/tester keep the state between segments/batches
+        # (the logic lives in BaseTrainer._train_epoch and BaseTester._evaluate_persistent_match_training_with_flatten)
         self.persistent_state = getattr(cfg, "persistent_state", False)
 
     def _reset_parameters(self):
