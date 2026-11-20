@@ -9,7 +9,8 @@ test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
 
 
 run_dir: /home/mhshah1/runs/persistent_4basins_seq_sweep
-experiment_name: persistent_4basins
+experiment_name: persistent_nonstationary_basins
+seed: 555
 
 
 train_start_date: '01/01/1990'
@@ -54,6 +55,8 @@ nan_handling_method: masked
 
 # --- Evaluation warm-up -----------------------------------------------------------------
 eval_warmup_steps: 90
+# warm-up spins up the state on the forcing BEFORE the period start, so the whole period is scored
+eval_warmup_from_preceding_period: true
 
 
 optimizer: Adam
