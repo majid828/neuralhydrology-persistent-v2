@@ -98,8 +98,9 @@ class BaseDataset(Dataset):
             self.basins = utils.load_basin_file(getattr(cfg, f"{period}_basin_file"))
         else:
             self.basins = [basin]
-        # Map basin id -> integer index (used for persistent LSTM state resets)
+        # Map basin id -> integer index (used only by persistent-state runs to keep one state per basin)
         self._basin_to_idx = {b: i for i, b in enumerate(self.basins)}
+        self._return_basin_idx = uses_persistent_state(cfg)
 
         self.additional_features = additional_features
         self.id_to_int = id_to_int
@@ -171,8 +172,9 @@ class BaseDataset(Dataset):
         basin, indices = self.lookup_table[item]
 
         sample = {}
-        # Integer basin index so the trainer can reset state per basin (persistent LSTM)
-        sample["basin_idx"] = torch.tensor(self._basin_to_idx[basin], dtype=torch.long)
+        # Integer basin index, only for persistent-state runs (other models get exactly the upstream sample)
+        if self._return_basin_idx:
+            sample["basin_idx"] = torch.tensor(self._basin_to_idx[basin], dtype=torch.long)
 
         for freq, seq_len, idx in zip(self.frequencies, self.seq_len, indices):
             # if there's just one frequency, don't use suffixes.
@@ -673,19 +675,25 @@ class BaseDataset(Dataset):
             valid_samples = np.argwhere(flag == 1).flatten()
 
             if self.non_overlapping_sequences:
-                # Non-overlapping chronological segments on a FIXED grid (manuscript Eq. 4-6): segment k ends at
-                # index k*L - 1. Invalid windows are left out without shifting the grid, so consecutive kept windows
-                # are either adjacent in time or separated by a visible gap (which the persistent trainer detects).
                 if len(self.frequencies) != 1:
                     raise ValueError(
                         "non_overlapping_sequences is currently only supported for single-frequency datasets.")
                 stride = int(self.seq_stride)
                 if stride <= 0:
                     raise ValueError("seq_stride must be a positive integer.")
-                valid_samples = select_window_ends(flag, seq_len=int(self.seq_len[0]), stride=stride)
-                # a basin without a single finite training target contributes no supervision: skip it
-                if self._persistent_training and not np.any(np.isfinite(y[self.frequencies[0]])):
-                    valid_samples = valid_samples[:0]
+                if self._return_basin_idx:
+                    # Persistent-state runs: non-overlapping chronological segments on a FIXED grid (manuscript
+                    # Eq. 4-6), segment k ends at index k*L - 1. Invalid windows are left out without shifting the
+                    # grid, so consecutive kept windows are adjacent in time or separated by a visible gap.
+                    valid_samples = select_window_ends(flag, seq_len=int(self.seq_len[0]), stride=stride)
+                    # a basin without a single finite training target contributes no supervision: skip it
+                    if self._persistent_training and not np.any(np.isfinite(y[self.frequencies[0]])):
+                        valid_samples = valid_samples[:0]
+                else:
+                    # Other models: thinning of the valid windows as in the v1 fork (option absent upstream).
+                    if stride == 1:
+                        stride = int(self.seq_len[0])
+                    valid_samples = valid_samples[::stride]
             elif self.seq_stride > 1:
                 stride = int(self.seq_stride)
                 if stride <= 0:

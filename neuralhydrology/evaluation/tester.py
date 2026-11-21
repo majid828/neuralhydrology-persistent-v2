@@ -314,7 +314,7 @@ class BaseTester(object):
             else:
                 raise RuntimeError("No model was initialized for the evaluation")
 
-        basins = list(self.basins)
+        basins = self.basins  # as in upstream NeuralHydrology (validation subsets shuffle this list in place)
         if self.period == "validation":
             if len(basins) > self.cfg.validate_n_random_basins:
                 random.shuffle(basins)

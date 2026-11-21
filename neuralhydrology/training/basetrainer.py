@@ -277,6 +277,10 @@ class BaseTrainer(object):
             LOGGER.info(f"Starting training from checkpoint {checkpoint_path}")
             self.model.load_state_dict(torch.load(str(checkpoint_path), map_location=self.device))
 
+        # Freeze model parts from pre-trained model (as in upstream NeuralHydrology; the v1 fork had dropped this).
+        if self.cfg.is_finetuning:
+            self._freeze_model_parts()
+
         self.optimizer = self._get_optimizer()
         self.loss_obj = self._get_loss_obj().to(self.device)
         self._set_regularization()
@@ -310,6 +314,37 @@ class BaseTrainer(object):
             self._target_std = torch.from_numpy(
                 ds.scaler["xarray_feature_scale"][self.cfg.target_variables].to_array().values
             ).to(self.device)
+
+    def _freeze_model_parts(self):
+        # freeze all model weights
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        unresolved_modules = []
+
+        # unfreeze parameters specified in config as tuneable parameters
+        if isinstance(self.cfg.finetune_modules, list):
+            for module_part in self.cfg.finetune_modules:
+                if module_part in self.model.module_parts:
+                    module = getattr(self.model, module_part)
+                    for param in module.parameters():
+                        param.requires_grad = True
+                else:
+                    unresolved_modules.append(module_part)
+        else:
+            # if it was no list, it has to be a dictionary
+            for module_group, module_parts in self.cfg.finetune_modules.items():
+                if module_group in self.model.module_parts:
+                    if isinstance(module_parts, str):
+                        module_parts = [module_parts]
+                    for module_part in module_parts:
+                        module = getattr(self.model, module_group)[module_part]
+                        for param in module.parameters():
+                            param.requires_grad = True
+                else:
+                    unresolved_modules.append(module_group)
+        if unresolved_modules:
+            LOGGER.warning(f"Could not resolve the following module parts for finetuning: {unresolved_modules}")
 
     def train_and_validate(self):
         """Train and validate the model."""
@@ -363,7 +398,8 @@ class BaseTrainer(object):
                 if self.cfg.metrics:
                     print_msg += " -- Median validation metrics: "
                     print_msg += ", ".join(f"{k}: {v:.5f}" for k, v in valid_metrics.items() if k != "avg_total_loss")
-                LOGGER.info(print_msg)
+                    # logged only if metrics are set, as in upstream NeuralHydrology
+                    LOGGER.info(print_msg)
 
                 if (
                     self._early_stopping

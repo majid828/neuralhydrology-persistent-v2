@@ -1,0 +1,93 @@
+# Checks that the persistent-state changes of this fork leave all other models unchanged.
+#
+# The same configurations are trained and evaluated with upstream NeuralHydrology (01510be, the base of this fork),
+# upstream plus its fix #303, this fork before version 2 (a3025c8), version 2 as first merged (0a40022) and the
+# checked-out tree, in one environment, and the outputs are compared bit for bit
+# (tools/model_isolation/compare_training.py). The pytest job runs the whole test suite on the checked-out tree.
+
+name: model isolation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - model-isolation-fixes
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  compare:
+    name: Compare with upstream (${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ["core", "models", "persistent"]
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: neuralhydrology
+          environment-file: environments/environment_cpu.yml
+          python-version: "3.10"
+          auto-activate-base: false
+      - name: Prepare the code trees
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/trees"
+          mkdir -p "$T"
+          git clone -q https://github.com/neuralhydrology/neuralhydrology.git "$T/upstream"
+          git -C "$T/upstream" checkout -q 01510be32bab0fe3d6fe4d3fd96a688650f2f324
+          git -C "$T/upstream" worktree add -q "$T/upstream303" 01510be32bab0fe3d6fe4d3fd96a688650f2f324
+          git -C "$T/upstream" show 9528d1d13eb82c9f038ee489d43784bc7aeb08cc -- neuralhydrology/utils/config.py \
+            | git -C "$T/upstream303" apply
+          git worktree add -q "$T/v1" a3025c8d192980b490735e086a01f23a5d0eb60e
+          git worktree add -q "$T/v2" 0a40022666563854f7fdce8b22d5706b3ffab5ab
+          for t in upstream upstream303 v1 v2; do
+            echo "$t: $(git -C "$T/$t" rev-parse HEAD), modified files: $(git -C "$T/$t" status --porcelain | wc -l)"
+          done
+          echo "v2fixed: $(git rev-parse HEAD)"
+          python -c "import torch, numpy, pandas, xarray; print('torch', torch.__version__, '| numpy', numpy.__version__, '| pandas', pandas.__version__, '| xarray', xarray.__version__)"
+      - name: Train, evaluate and compare (${{ matrix.group }})
+        run: |
+          T="$RUNNER_TEMP/trees"
+          mkdir -p "$RUNNER_TEMP/tool"
+          cp tools/model_isolation/compare_training.py "$RUNNER_TEMP/tool/"
+          python "$RUNNER_TEMP/tool/compare_training.py" drive --group "${{ matrix.group }}" \
+            --data-root "$T/upstream" --out "$RUNNER_TEMP/out" \
+            --tree upstream="$T/upstream" --tree upstream303="$T/upstream303" \
+            --tree v1="$T/v1" --tree v2="$T/v2" --tree v2fixed="$GITHUB_WORKSPACE"
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-isolation-${{ matrix.group }}
+          path: |
+            ${{ runner.temp }}/out/report_*.json
+            ${{ runner.temp }}/out/**/meta.json
+            ${{ runner.temp }}/out/**/stdout.txt
+
+  pytest:
+    name: Test suite on this branch
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: neuralhydrology
+          environment-file: environments/environment_cpu.yml
+          python-version: "3.10"
+          auto-activate-base: false
+      - run: |
+          pytest -v test/test_model_isolation.py test/test_persistent_lstm.py
+          pytest -q

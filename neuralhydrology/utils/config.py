@@ -1035,11 +1035,17 @@ class Config(object):
         if self.early_stopping:
             return self._get_value_verbose("minimum_epochs_before_early_stopping")
 
-    # CHANGE (BUGFIX): in your old version, this incorrectly returned early_stopping.
+    # Same as upstream NeuralHydrology after its fix #303 (commit 9528d1d); the base commit returned early_stopping.
     @property
     def dynamic_learning_rate(self) -> bool:
-        """Whether to use dynamic learning rate scheduler. Defaults to False if not set."""
-        return self._cfg.get("dynamic_learning_rate", False)
+        """Whether to use  dynamic learning rate. Defaults to False if not set."""
+        dynamic_lr = self._cfg.get("dynamic_learning_rate", False)
+        if dynamic_lr and self.validate_every != 1:
+            raise ValueError(
+                "Dynamic learning rate can only be used if validation is performed every epoch (validate_every=1). "
+                "Set validate_every=1 in the config to use dynamic learning rate."
+            )
+        return dynamic_lr
 
     @property
     def patience_dynamic_learning_rate(self) -> int:
