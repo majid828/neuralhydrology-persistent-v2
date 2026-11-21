@@ -181,7 +181,7 @@ def scenarios(group, repo=None, tmean_dir=None):
                                                          dynamic_inputs=["tmax(C)"]), eval_epoch=1),
                          ALL_TREES, "upstream", ["v2fixed"])
         forecast = dict(DAILY, hindcast_inputs=["prcp(mm/day)", "tmax(C)"], forecast_inputs=["prcp(mm/day)", "tmax(C)"],
-                        forecast_seq_length=7, predict_last_n=7)
+                        seq_length=30, forecast_seq_length=7, predict_last_n=7)  # Config checks both together
         fc = {"type": "fc", "hiddens": [16], "activation": "tanh", "dropout": 0.0}
         forecast_models = {
             "handoff_forecast_lstm": dict(forecast, forecast_overlap=3, hindcast_hidden_size=16, forecast_hidden_size=16,
