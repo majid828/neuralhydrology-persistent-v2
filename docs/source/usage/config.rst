@@ -455,14 +455,17 @@ Training settings
 Persistent-state LSTM settings
 ------------------------------
 Used with ``model: persistentlstm`` (see ``neuralhydrology/utils/persistentutils.py`` for the checks that are applied).
+The persistent-state code runs only for ``model: persistentlstm`` together with ``persistent_state: True``; every other
+model is trained and evaluated exactly as in NeuralHydrology.
 
 -  ``persistent_state``: True/False. Carry each basin's detached hidden and cell state between consecutive,
-   time-contiguous segments within an epoch (truncated backpropagation through time). Requires
-   ``model: persistentlstm``, a single frequency, ``non_overlapping_sequences: True``,
+   time-contiguous segments within an epoch (truncated backpropagation through time). Required by
+   ``model: persistentlstm`` and only allowed with it. Also requires a single frequency, ``non_overlapping_sequences: True``,
    ``predict_last_n == seq_length`` and ``seq_stride`` equal to 1 or ``seq_length``.
 
 -  ``non_overlapping_sequences``: True/False. Split each basin's series into non-overlapping segments of length
-   ``seq_length`` on a fixed time grid.
+   ``seq_length``: on a fixed time grid for persistent-state runs; for other models every ``seq_stride``-th valid
+   window (every ``seq_length``-th if ``seq_stride`` is 1), as in version 1 of this fork.
 
 -  ``seq_stride``: Distance between segment ends (1 or ``seq_length`` for persistent training).
 

@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: ["core", "models", "persistent"]
+        group: ["core", "models", "persistent", "repo_baselines", "repo_persistent"]
     defaults:
       run:
         shell: bash -el {0}

@@ -110,6 +110,7 @@ def test_loss_scores_every_step_of_flattened_batch():
     ({"eval_warmup_steps": 61}, True),
     ({"persistent_state_init_file": "states.p"}, True),
     ({"model": "cudalstm"}, True),
+    ({"persistent_state": False}, True),  # persistentlstm would otherwise silently train like a standard LSTM
 ])
 def test_validate_persistent_config(update, should_raise):
     cfg = _cfg()

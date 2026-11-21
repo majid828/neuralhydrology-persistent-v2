@@ -16,9 +16,9 @@ class PersistentLSTMModel(BaseModel):
     - Uses the same InputLayer + head design as CudaLSTM.
     - Supports carrying hidden state across segments/batches via
       the `hidden_state` argument and the `"hidden_state"` output key.
-    - Backward compatible: if you don't use `persistent_state` in the config
-      and don't pass `hidden_state`, it behaves like a normal CudaLSTM-style
-      sequence model.
+    - Without a `hidden_state` argument a forward pass starts from the zero state, like CudaLSTM. Training and
+      evaluation with `model: persistentlstm` always use the persistent-state method: the config must set
+      `persistent_state: true` (checked by utils.persistentutils.validate_persistent_config).
 
     Assumptions:
     - Single frequency (persistent-state runs are validated by utils.persistentutils.validate_persistent_config).

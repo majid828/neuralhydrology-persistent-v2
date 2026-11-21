@@ -50,13 +50,22 @@ def validate_persistent_config(cfg) -> None:
     than 'persistentlstm' would ignore persistent_state altogether.
     """
     if not bool(getattr(cfg, "persistent_state", False)):
+        if str(cfg.model).lower() == "persistentlstm":
+            # without this check the model would silently be trained like a standard LSTM
+            raise ValueError("'model: persistentlstm' trains with the persistent-state method and needs "
+                             "'persistent_state: true' (see test/test_configs/persistent_lstm_*.test.yml). For a "
+                             "standard LSTM use 'model: cudalstm'; for the no-carry ablation keep "
+                             "'persistent_state: true' and set 'ablate_state_carry: true'.")
         if bool(getattr(cfg, "ablate_state_carry", False)):
             raise ValueError("'ablate_state_carry' only applies to runs with 'persistent_state: true'.")
         return
 
     errors = []
     if str(cfg.model).lower() != "persistentlstm":
-        errors.append(f"'persistent_state: true' requires 'model: persistentlstm' (got '{cfg.model}').")
+        errors.append(f"'persistent_state: true' requires 'model: persistentlstm' (got '{cfg.model}'). To train "
+                      f"another model, use that model's own config file (e.g. "
+                      f"test/test_configs/cuda_lstm_for_long_memory_basins.test.yml) without the persistent-state "
+                      f"keys.")
     if cfg.use_frequencies and len(cfg.use_frequencies) > 1:
         errors.append(f"persistent-state training supports one frequency only (got {cfg.use_frequencies}).")
     if not cfg.non_overlapping_sequences:

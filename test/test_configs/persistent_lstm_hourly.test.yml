@@ -5,12 +5,12 @@ test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
 run_dir: /home/mhshah1/runs/persistent_4basins_seq_sweep/persistent_seed_555_0605_233226
 experiment_name: persistent_hourly_seed_555
 
-train_start_date: "1990-01-01 00:00:00"
-train_end_date: "2008-09-30 00:00:00"
-validation_start_date: "2008-10-01 00:00:00"
-validation_end_date: "2012-09-30 00:00:00"
-test_start_date: "2012-10-01 00:00:00"
-test_end_date: "2013-10-30 00:00:00"
+train_start_date: '01/01/1990'
+train_end_date: '30/09/2008'
+validation_start_date: '01/10/2008'
+validation_end_date: '30/09/2012'
+test_start_date: '01/10/2012'
+test_end_date: '30/10/2013'
 
 dataset: hourly_camels_us
 data_dir: /mnt/disk1/CAMELS_US
