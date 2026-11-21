@@ -398,7 +398,8 @@ class BaseTrainer(object):
                 if self.cfg.metrics:
                     print_msg += " -- Median validation metrics: "
                     print_msg += ", ".join(f"{k}: {v:.5f}" for k, v in valid_metrics.items() if k != "avg_total_loss")
-                LOGGER.info(print_msg)
+                    # logged only if metrics are set, as in upstream NeuralHydrology
+                    LOGGER.info(print_msg)
 
                 if (
                     self._early_stopping

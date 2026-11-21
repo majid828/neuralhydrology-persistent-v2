@@ -101,7 +101,7 @@ def test_finetuning_freezes_the_other_modules(get_config: Fixture[Callable[[str]
     finetune_file = tmp_path / "finetune.yml"
     with finetune_file.open("w") as fp:
         YAML().dump({"base_run_dir": str(base_dir), "finetune_modules": ["head"], "epochs": 1,
-                     "learning_rate": {0: 0.001}, "run_dir": str(tmp_path / "finetune"),
+                     "learning_rate": 0.001, "run_dir": str(tmp_path / "finetune"),
                      "experiment_name": "finetune"}, fp)
     (tmp_path / "finetune").mkdir()
     nh_run.finetune(config_file=finetune_file)

@@ -16,6 +16,9 @@ Compared per run: all saved weights and optimizer states (``torch.equal`` on eve
 results (every array, NaN-aware), metric files, the logged epoch losses, the learning rate at the start of every
 epoch, the type of the training data sampler, the keys of a training sample and a hash of every training sample.
 
+numba's random generator (used by the random holdout of dynamic inputs) is seeded identically for every run, because
+NeuralHydrology's seeding does not reach it.
+
 It also runs two checks that only apply to the fork:
 
 * ``persistent``: instruments a Persistent-State LSTM run and checks the state hand-over batch by batch (state of
@@ -83,7 +86,7 @@ def scenarios(group):
         base = dict(DAILY, model="cudalstm")
         out["finetune_head"] = (_spec("daily_regression", base, kind="finetune",
                                       finetune={"finetune_modules": ["head"], "epochs": 1,
-                                                "learning_rate": {0: 0.001}}),
+                                                "learning_rate": 0.001}),
                                 ALL_TREES, "upstream", ["v2fixed"])
         out["target_noise"] = (_spec("daily_regression", dict(base, target_noise_std=0.2), eval_epoch=1),
                                ALL_TREES, "upstream", ["v2fixed"])
@@ -473,7 +476,53 @@ def _train_and_eval(spec: dict, data_root: Path, run_parent: Path, meta: dict, p
         start_evaluation(cfg=cfg, run_dir=run_dir, epoch=spec["eval_epoch"], period="test")
 
     meta["dataset"] = _dataset_fingerprint(trainer.loader.dataset)
+    try:
+        meta["test_result_dates"] = _result_dates(Path(meta.get("finetune_run_dir", run_dir)))
+    except Exception as err:  # informational only
+        meta["test_result_dates"] = {"error": repr(err)}
     return trainer
+
+
+def _result_dates(run_dir: Path) -> dict:
+    """Per frequency: number of scored dates of the first basin, first and last date (test period)."""
+    import numpy as np
+    files = sorted(run_dir.glob("test/*/test_results.p"))
+    if not files:
+        return {}
+    with files[-1].open("rb") as fp:
+        results = pickle.load(fp)
+    basin = sorted(results)[0]
+    out = {"basin": basin}
+    for freq, res in results[basin].items():
+        xr = res["xr"]
+        sim = [v for v in xr.data_vars if v.endswith("_sim")][0]
+        values = xr[sim]
+        dim = "date" if "date" in values.dims else "datetime"
+        if "time_step" in values.dims:
+            values = values.isel(time_step=-1)
+        if "samples" in values.dims:
+            values = values.mean("samples")
+        dates = values[dim].values[np.isfinite(values.values)]
+        out[freq] = {"n_scored": int(dates.size), "first": str(dates.min()) if dates.size else None,
+                     "last": str(dates.max()) if dates.size else None}
+    return out
+
+
+def _seed_numba_rng(seed: int):
+    """Seed numba's own random generator, the same way in every tree.
+
+    NeuralHydrology seeds Python, NumPy and torch, but numba-compiled functions draw from numba's separate generator,
+    which np.random.seed does not reach. The random holdout of dynamic inputs (samplingutils.bernoulli_subseries_sampler,
+    used by the ARLSTM test configuration) draws from it, so without this even two upstream runs differ.
+    """
+    import numpy as np
+    from numba import njit
+
+    @njit
+    def _seed(value):
+        np.random.seed(value)
+
+    _seed(seed)
 
 
 def run_in_tree(args):
@@ -490,15 +539,34 @@ def run_in_tree(args):
     specs = json.loads(Path(args.spec).read_text())
     out = Path(args.out)
     probe = Probe(instrument_persistent=args.instrument_persistent)
+
+    # NeuralHydrology logs through logging.basicConfig, which configures the root logger only once per process: in a
+    # process with several runs, later runs write no output.log of their own. The handler below records the messages of
+    # every run in the same way, without touching the root logger.
+    import logging
+    messages = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            msg = record.getMessage()
+            if any(k in msg for k in LOG_KEYS):
+                messages.append(msg.strip())
+
+    logging.getLogger("neuralhydrology").addHandler(_Collect(level=logging.INFO))
     for i, spec in enumerate(specs):
         sub = out / (f"step{i}_{spec['name']}" if len(specs) > 1 else "")
         sub.mkdir(parents=True, exist_ok=True)
         meta = {"name": spec["name"], "tree": str(tree), "nh_file": str(nh_file), "torch": torch.__version__,
                 "started": time.time()}
         probe.lr_trace, probe.events = [], []
+        messages.clear()
+        _seed_numba_rng(111)
         try:
             _train_and_eval(spec, Path(args.data_root), sub / "runs", meta, probe)
             meta["lr_trace"] = probe.lr_trace
+            meta["log_messages"] = list(messages)
+            log_file = Path(meta["run_dir"]) / "output.log"
+            meta["output_log_lines"] = len(log_file.read_text().splitlines()) if log_file.is_file() else None
             meta["probe_counts"] = dict(probe.counts)
             if args.instrument_persistent:
                 import numpy as np
@@ -553,12 +621,14 @@ def _files(run_dir: Path, pattern: str):
     return {str(p.relative_to(run_dir)): p for p in sorted(run_dir.glob(pattern))}
 
 
+LOG_KEYS = ("average loss", "average validation loss", "Setting learning rate")
+
+
 def _log_lines(run_dir: Path):
     log = run_dir / "output.log"
     if not log.is_file():
         return []
-    keep = ("average loss", "average validation loss", "Setting learning rate")
-    return [line.split(": ", 1)[-1].strip() for line in log.read_text().splitlines() if any(k in line for k in keep)]
+    return [line.split(": ", 1)[-1].strip() for line in log.read_text().splitlines() if any(k in line for k in LOG_KEYS)]
 
 
 def compare_runs(ref_dir: Path, cand_dir: Path) -> dict:
@@ -605,8 +675,12 @@ def compare_runs(ref_dir: Path, cand_dir: Path) -> dict:
             for name in set(rf) | set(cf):
                 if name not in rf or name not in cf or rf[name].read_text() != cf[name].read_text():
                     details.append(f"{tag}{name}: differs")
-        if _log_lines(r) != _log_lines(c):
-            details.append(f"{tag}logged losses / learning rates differ")
+        if "log_messages" in ref_meta and "log_messages" in cand_meta:
+            same_log = ref_meta["log_messages"] == cand_meta["log_messages"]
+        else:
+            same_log = _log_lines(r) == _log_lines(c)
+        if not tag and not same_log:
+            details.append("logged losses / learning rates differ")
     for key in ["lr_trace", "loader", "finetune_trainable"]:
         if ref_meta.get(key) != cand_meta.get(key):
             details.append(f"{key}: {ref_meta.get(key)} vs {cand_meta.get(key)}")
@@ -615,10 +689,16 @@ def compare_runs(ref_dir: Path, cand_dir: Path) -> dict:
         if rd[key] != cd[key]:
             details.append(f"training samples: {key} differs" + (f" ({rd[key]} vs {cd[key]})" if key in
                                                                 ("n_samples", "sample_keys") else ""))
-    if rd["samples_sha256"] != cd["samples_sha256"] and rd["samples_without_basin_idx_sha256"] == \
-            cd["samples_without_basin_idx_sha256"]:
+    only_basin_idx = (rd["samples_sha256"] != cd["samples_sha256"]
+                      and rd["samples_without_basin_idx_sha256"] == cd["samples_without_basin_idx_sha256"]
+                      and set(rd["sample_keys"]) ^ set(cd["sample_keys"]) == {"basin_idx"})
+    if only_basin_idx:
+        details = [d for d in details if not d.startswith("training samples: ")]
         details.append("training samples: identical apart from the extra 'basin_idx' entry")
-    return {"status": "identical" if not details else "different", "details": details}
+        status = "identical_except_basin_idx" if len(details) == 1 else "different"
+    else:
+        status = "identical" if not details else "different"
+    return {"status": status, "details": details}
 
 
 def _compare_tensors_nested(a, b, torch, path=""):
@@ -718,13 +798,17 @@ def drive(args):
             err = _error_of(out / name / label / "meta.json")
             if err or ref_err:
                 result = {"status": "error", "error": err, "reference_error": ref_err}
+                print(f"   {label:>16} ERROR: {err or ''} | reference: {ref_err or ''}", flush=True)
             else:
                 result = compare_runs(ref_dir, out / name / label)
             entry["results"][label] = result
             print(f"   {label:>16} vs {reference}: {result['status']}", flush=True)
             for d in result.get("details", [])[:6]:
                 print(f"{'':22}- {d}", flush=True)
-            if label in must_match and result["status"] != "identical":
+            accepted = {"identical"}
+            if reference.startswith("v1") and label == "v2fixed":
+                accepted.add("identical_except_basin_idx")  # v2fixed drops v1's basin_idx for non-persistent models
+            if label in must_match and result["status"] not in accepted:
                 report["failures"].append(f"{name}: {label} is not identical to {reference}")
         if spec["kind"] == "finetune":
             entry["frozen"] = {label: frozen_check(out / name / label / "meta.json") for label in run_trees}
