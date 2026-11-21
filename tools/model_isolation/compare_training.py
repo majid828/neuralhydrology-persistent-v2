@@ -85,6 +85,34 @@ REPO_TEST_DATA = {
 REPO_BASELINE_CONFIGS = ["cuda_lstm_for_long_memory_basins", "cuda_lstm_nonstationary_basins", "mts_lstm_hourly"]
 REPO_PERSISTENT_CONFIGS = ["persistent_lstm_for_long_memory_basins", "persistent_lstm_nonstationary_basins",
                            "persistent_lstm_hourly"]  # persistent_lstm_15_mint: no 15-min test data
+# the nonstationary configs use a 'Tmean(C)' forcing column that the CAMELS-US NLDAS test files do not have
+NEEDS_TMEAN = {"cuda_lstm_nonstationary_basins", "persistent_lstm_nonstationary_basins"}
+
+
+def test_data_with_tmean(data_root: Path, out: Path) -> Path:
+    """Copy of the test data whose NLDAS files gain a 'Tmean(C)' column = (Tmax + Tmin) / 2 (test input only)."""
+    import shutil
+    target = out / "test_data_tmean" / "camels_us"
+    if target.is_dir():
+        return target
+    shutil.copytree(data_root / "test" / "test_data" / "camels_us", target)
+    for f in sorted((target / "basin_mean_forcing" / "nldas").glob("*_forcing_leap.txt")):
+        lines = f.read_text().splitlines()
+        header = lines[3].split()
+        i_max, i_min = header.index("Tmax(C)"), header.index("Tmin(C)")
+        new = lines[:3] + [lines[3] + "\tTmean(C)"]
+        for line in lines[4:]:
+            tokens = line.split()
+            new.append(line + f"\t{(float(tokens[i_max]) + float(tokens[i_min])) / 2:.2f}" if tokens else line)
+        f.write_text("\n".join(new) + "\n")
+    return target
+
+
+def _repo_update(name: str, tmean_dir):
+    update = dict(REPO_TEST_DATA)
+    if name in NEEDS_TMEAN:
+        update["data_dir"] = str(tmean_dir)  # absolute, so it is not joined to the data root
+    return update
 
 
 def _spec(config, update=None, kind="train_eval", eval_epoch=None, finetune=None, config_file=None):
@@ -92,12 +120,12 @@ def _spec(config, update=None, kind="train_eval", eval_epoch=None, finetune=None
             "config_file": config_file}
 
 
-def scenarios(group, repo=None):
+def scenarios(group, repo=None, tmean_dir=None):
     """Scenario name -> (run spec, trees to run, reference tree, trees that must match the reference)."""
     out = {}
     if group == "repo_baselines":
         for name in REPO_BASELINE_CONFIGS:
-            out[f"repo_{name}"] = (_spec(name, REPO_TEST_DATA, eval_epoch=2,
+            out[f"repo_{name}"] = (_spec(name, _repo_update(name, tmean_dir), eval_epoch=2,
                                          config_file=str(repo / "test" / "test_configs" / f"{name}.test.yml")),
                                    ["upstream", "v1", "v2fixed"], "upstream", ["v2fixed"])
     if group in ("core", "all"):
@@ -803,7 +831,9 @@ def drive(args):
     out = Path(args.out).resolve()
     report = {"group": args.group, "scenarios": {}, "failures": []}
 
-    for name, (spec, run_trees, reference, must_match) in scenarios(args.group, repo=trees["v2fixed"]).items():
+    tmean_dir = test_data_with_tmean(data_root, out) if args.group.startswith("repo_") else None
+    for name, (spec, run_trees, reference, must_match) in scenarios(args.group, repo=trees["v2fixed"],
+                                                                    tmean_dir=tmean_dir).items():
         print(f"== scenario {name}", flush=True)
         spec = dict(spec, name=name)
         # every reference run is repeated in a second fresh process: 'identical' only means something if the
@@ -869,7 +899,7 @@ def drive(args):
     if args.group in ("persistent", "all"):
         report["persistent"] = persistent_and_switching(trees, data_root, out, report["failures"])
     if args.group == "repo_persistent":
-        report["repo_persistent"] = repo_persistent(trees, data_root, out, report["failures"])
+        report["repo_persistent"] = repo_persistent(trees, data_root, out, report["failures"], tmean_dir)
 
     (out / f"report_{args.group}.json").write_text(json.dumps(report, indent=1, default=str))
     print("\n== SUMMARY", flush=True)
@@ -881,12 +911,12 @@ def drive(args):
     print("All expectations met.", flush=True)
 
 
-def repo_persistent(trees, data_root, out, failures):
+def repo_persistent(trees, data_root, out, failures, tmean_dir):
     """The repository's Persistent-State LSTM configs, instrumented (Test 1 with the manuscript settings)."""
     res = {}
     for name in REPO_PERSISTENT_CONFIGS:
         print(f"== repository config {name} (instrumented)", flush=True)
-        spec = dict(_spec(name, REPO_TEST_DATA, eval_epoch=2,
+        spec = dict(_spec(name, _repo_update(name, tmean_dir), eval_epoch=2,
                           config_file=str(trees["v2fixed"] / "test" / "test_configs" / f"{name}.test.yml")),
                     name=name)
         _launch(trees["v2fixed"], [spec], out / "repo_persistent" / name, data_root, instrument=True)
