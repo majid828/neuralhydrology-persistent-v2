@@ -10,6 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
+import pytest
 import torch
 from ruamel.yaml import YAML
 from torch.utils.data import BatchSampler, RandomSampler
@@ -19,7 +20,20 @@ from neuralhydrology.datasetzoo import get_dataset
 from neuralhydrology.training.basetrainer import BaseTrainer
 from neuralhydrology.training.train import start_training
 from neuralhydrology.utils.config import Config
+from neuralhydrology.utils.persistentutils import uses_persistent_state, validate_persistent_config
 from test import Fixture
+
+CONFIG_DIR = Path(__file__).parent / "test_configs"
+# manuscript configs: file name -> whether it must select the persistent-state method
+MANUSCRIPT_CONFIGS = {
+    "persistent_lstm_for_long_memory_basins": True,
+    "persistent_lstm_nonstationary_basins": True,
+    "persistent_lstm_hourly": True,
+    "persistent_lstm_15_mint": True,
+    "cuda_lstm_for_long_memory_basins": False,
+    "cuda_lstm_nonstationary_basins": False,
+    "mts_lstm_hourly": False,
+}
 
 DAILY = {
     "model": "cudalstm",
@@ -112,3 +126,28 @@ def test_finetuning_freezes_the_other_modules(get_config: Fixture[Callable[[str]
     changed = {k for k in base if not torch.equal(base[k], tuned[k])}
     assert changed, "finetuning did not change any weight"
     assert all(k.startswith("head.") for k in changed), f"frozen modules changed: {sorted(changed)}"
+
+
+@pytest.mark.parametrize("name, persistent", MANUSCRIPT_CONFIGS.items())
+def test_manuscript_config_selects_its_training(name: str, persistent: bool):
+    """Each manuscript config loads (known keys, readable dates) and the config alone selects the training method."""
+    config = Config(CONFIG_DIR / f"{name}.test.yml")
+    validate_persistent_config(config)
+    assert uses_persistent_state(config) == persistent
+    assert (config.model.lower() == "persistentlstm") == persistent
+
+
+def test_changing_only_the_model_line_is_refused():
+    """A persistent config with only 'model:' changed would not describe the baseline; the run must stop."""
+    config = Config(CONFIG_DIR / "persistent_lstm_for_long_memory_basins.test.yml")
+    config.update_config({"model": "cudalstm"})
+    with pytest.raises(ValueError, match="own config file"):
+        validate_persistent_config(config)
+
+
+def test_persistentlstm_requires_persistent_state():
+    """'model: persistentlstm' without 'persistent_state: true' must not silently train like a standard LSTM."""
+    config = Config(CONFIG_DIR / "persistent_lstm_for_long_memory_basins.test.yml")
+    config.update_config({"persistent_state": False})
+    with pytest.raises(ValueError, match="persistent_state: true"):
+        validate_persistent_config(config)

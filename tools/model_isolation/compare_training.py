@@ -70,14 +70,36 @@ PERSISTENT = dict(DAILY, model="persistentlstm", persistent_state=True, non_over
 
 ALL_TREES = ["upstream", "v1", "v2", "v2fixed"]
 
+# The manuscript configs of this repository (test/test_configs), run as they are except for what points to data and
+# hardware: the 4-basin test data, its periods, CPU, 2 epochs, validation and weights after every epoch.
+REPO_TEST_DATA = {
+    "train_basin_file": "test/test_data/4_basins_test_set.txt",
+    "validation_basin_file": "test/test_data/4_basins_test_set.txt",
+    "test_basin_file": "test/test_data/4_basins_test_set.txt",
+    "train_start_date": "01/01/2000", "train_end_date": "31/12/2001",
+    "validation_start_date": "01/01/2001", "validation_end_date": "31/12/2002",
+    "test_start_date": "01/01/2001", "test_end_date": "31/12/2002",
+    "data_dir": "test/test_data/camels_us", "device": "cpu", "num_workers": 0, "epochs": 2, "validate_every": 1,
+    "save_weights_every": 1, "log_tensorboard": False,
+}
+REPO_BASELINE_CONFIGS = ["cuda_lstm_for_long_memory_basins", "cuda_lstm_nonstationary_basins", "mts_lstm_hourly"]
+REPO_PERSISTENT_CONFIGS = ["persistent_lstm_for_long_memory_basins", "persistent_lstm_nonstationary_basins",
+                           "persistent_lstm_hourly"]  # persistent_lstm_15_mint: no 15-min test data
 
-def _spec(config, update=None, kind="train_eval", eval_epoch=None, finetune=None):
-    return {"config": config, "update": update or {}, "kind": kind, "eval_epoch": eval_epoch, "finetune": finetune}
+
+def _spec(config, update=None, kind="train_eval", eval_epoch=None, finetune=None, config_file=None):
+    return {"config": config, "update": update or {}, "kind": kind, "eval_epoch": eval_epoch, "finetune": finetune,
+            "config_file": config_file}
 
 
-def scenarios(group):
+def scenarios(group, repo=None):
     """Scenario name -> (run spec, trees to run, reference tree, trees that must match the reference)."""
     out = {}
+    if group == "repo_baselines":
+        for name in REPO_BASELINE_CONFIGS:
+            out[f"repo_{name}"] = (_spec(name, REPO_TEST_DATA, eval_epoch=2,
+                                         config_file=str(repo / "test" / "test_configs" / f"{name}.test.yml")),
+                                   ["upstream", "v1", "v2fixed"], "upstream", ["v2fixed"])
     if group in ("core", "all"):
         cuda = dict(DAILY, model="cudalstm", epochs=2, validate_n_random_basins=2, save_validation_results=True)
         out["cudalstm"] = (_spec("daily_regression", cuda, eval_epoch=2),
@@ -136,8 +158,9 @@ def scenarios(group):
 
 def _absolute_paths(update: dict, data_root: Path) -> dict:
     update = copy.deepcopy(update)
-    if "data_dir" in update:
-        update["data_dir"] = str(data_root / update["data_dir"])
+    for key in update:
+        if key == "data_dir" or key.endswith("_basin_file"):
+            update[key] = str(data_root / update[key])
     return update
 
 
@@ -434,7 +457,8 @@ def _train_and_eval(spec: dict, data_root: Path, run_parent: Path, meta: dict, p
     from neuralhydrology.training.train import start_training
     from neuralhydrology.utils.config import Config
 
-    cfg = Config(data_root / "test" / "test_configs" / f"{spec['config']}.test.yml")
+    config_file = spec.get("config_file") or data_root / "test" / "test_configs" / f"{spec['config']}.test.yml"
+    cfg = Config(Path(config_file))
     cfg.update_config(_absolute_paths(spec["update"], data_root))
     run_parent.mkdir(parents=True, exist_ok=True)
     cfg.run_dir = run_parent
@@ -570,7 +594,10 @@ def run_in_tree(args):
             meta["probe_counts"] = dict(probe.counts)
             if args.instrument_persistent:
                 import numpy as np
-                meta["persistent_checks"] = analyse_persistent(probe, np.timedelta64(1, "D"))
+                step = getattr(probe.trainers[-1], "_persistent_time_step", None)
+                meta["persistent_time_step"] = str(step)
+                meta["persistent_checks"] = analyse_persistent(probe, step if step is not None else
+                                                               np.timedelta64(1, "D"))
             meta["error"] = None
         except Exception:  # record the failure and keep the remaining runs going
             meta["error"] = traceback.format_exc()
@@ -776,7 +803,7 @@ def drive(args):
     out = Path(args.out).resolve()
     report = {"group": args.group, "scenarios": {}, "failures": []}
 
-    for name, (spec, run_trees, reference, must_match) in scenarios(args.group).items():
+    for name, (spec, run_trees, reference, must_match) in scenarios(args.group, repo=trees["v2fixed"]).items():
         print(f"== scenario {name}", flush=True)
         spec = dict(spec, name=name)
         # every reference run is repeated in a second fresh process: 'identical' only means something if the
@@ -841,6 +868,8 @@ def drive(args):
 
     if args.group in ("persistent", "all"):
         report["persistent"] = persistent_and_switching(trees, data_root, out, report["failures"])
+    if args.group == "repo_persistent":
+        report["repo_persistent"] = repo_persistent(trees, data_root, out, report["failures"])
 
     (out / f"report_{args.group}.json").write_text(json.dumps(report, indent=1, default=str))
     print("\n== SUMMARY", flush=True)
@@ -850,6 +879,32 @@ def drive(args):
         print("FAILED EXPECTATIONS:\n  " + "\n  ".join(report["failures"]), flush=True)
         sys.exit(1)
     print("All expectations met.", flush=True)
+
+
+def repo_persistent(trees, data_root, out, failures):
+    """The repository's Persistent-State LSTM configs, instrumented (Test 1 with the manuscript settings)."""
+    res = {}
+    for name in REPO_PERSISTENT_CONFIGS:
+        print(f"== repository config {name} (instrumented)", flush=True)
+        spec = dict(_spec(name, REPO_TEST_DATA, eval_epoch=2,
+                          config_file=str(trees["v2fixed"] / "test" / "test_configs" / f"{name}.test.yml")),
+                    name=name)
+        _launch(trees["v2fixed"], [spec], out / "repo_persistent" / name, data_root, instrument=True)
+        mf = out / "repo_persistent" / name / "meta.json"
+        err = _error_of(mf)
+        meta = {} if err else json.loads(mf.read_text())
+        checks = meta.get("persistent_checks")
+        executed = {k: v for k, v in (meta.get("probe_counts") or {}).items() if v}
+        res[name] = {"error": err, "checks": checks, "persistent_code_calls": executed, "loader": meta.get("loader"),
+                     "time_step": meta.get("persistent_time_step")}
+        status = "ERROR " + err if err else ("PASSED" if checks["passed"] else "FAILED")
+        print(f"   {status}; time step {meta.get('persistent_time_step')}; loader {meta.get('loader')}; "
+              f"persistent code calls {executed}", flush=True)
+        if checks:
+            print("   " + json.dumps(checks), flush=True)
+        if err or not checks["passed"] or not executed.get("BaseTrainer._cache_persistent_state"):
+            failures.append(f"repository config {name}: persistent checks failed")
+    return res
 
 
 def persistent_and_switching(trees, data_root, out, failures):
@@ -918,7 +973,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("drive")
-    d.add_argument("--group", choices=["core", "models", "persistent", "all"], required=True)
+    d.add_argument("--group", choices=["core", "models", "persistent", "repo_baselines", "repo_persistent", "all"],
+                   required=True)
     d.add_argument("--data-root", required=True, help="upstream tree (its test configs and test data are used)")
     d.add_argument("--out", required=True)
     d.add_argument("--tree", action="append", required=True, help="label=path")

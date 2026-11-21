@@ -177,6 +177,7 @@ cases = [("valid daily config", cfg_ns(), False),
          ("warm-up 61 not multiple of L", cfg_ns(eval_warmup_steps=61), True),
          ("init file + preceding warm-up", cfg_ns(persistent_state_init_file="x.p"), True),
          ("persistent_state with cudalstm", cfg_ns(model="cudalstm"), True),
+         ("persistentlstm without persistent_state", cfg_ns(persistent_state=False), True),
          ("non-persistent cudalstm run", cfg_ns(persistent_state=False, model="cudalstm"), False)]
 outcomes = []
 for name, c, should_raise in cases:

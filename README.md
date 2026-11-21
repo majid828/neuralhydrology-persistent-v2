@@ -17,7 +17,7 @@ This code is derived from the open-source NeuralHydrology framework and extends 
    - loss over every valid time step of the flattened stream; truncated backpropagation through time (states detached after each optimizer update)
    - states reset at the start of every epoch, at a basin's first segment, and where the forcing record has a gap
 3. Evaluation workflow (`neuralhydrology/evaluation/tester.py`): one continuous stream per basin, optional causal warm-up (from the forcing before the period start), optional saving and reloading of final states
-4. Dataset handling (`neuralhydrology/datasetzoo/basedataset.py`): non-overlapping segments on a fixed time grid, basin index per sample
+4. Dataset handling (`neuralhydrology/datasetzoo/basedataset.py`): non-overlapping segments on a fixed time grid and a basin index per sample (persistent-state runs only)
 5. Shared helpers and configuration checks: `neuralhydrology/utils/persistentutils.py`
 6. 15-minute CAMELS-US dataset: `neuralhydrology/datasetzoo/fifteenminutecamelsus.py`
 
@@ -33,7 +33,7 @@ This code is derived from the open-source NeuralHydrology framework and extends 
 | 4 | States detached and cached after the optimizer update (Eq. 13, Algorithm 1 step 16) | Cached before the update (same values) | Cached after the update | `training/basetrainer.py` |
 | 5 | Evaluation over the test period (Sec. 2.9) | Warm-up consumed the first 30-90 days of the test period, which were then not scored | New option `eval_warmup_from_preceding_period: true`: the warm-up runs on the forcing before the period start, so the whole period is scored (same dates as the baselines) | `datasetzoo/basedataset.py`, configs |
 | 6 | States are saved and reloaded for operational initialization (Sec. 1) | Not implemented | `save_persistent_states: true` writes each basin's final `(h, c)` and time stamp; `persistent_state_init_file` initializes a following period from them | `evaluation/tester.py`, `utils/config.py` |
-| 7 | Released configs reproduce the manuscript runs (Sec. 5) | Hourly YAML did not parse; file names with commas; no seed in the daily configs | Fixed indentation, renamed files, seeds added | `test/test_configs/` |
+| 7 | Released configs reproduce the manuscript runs (Sec. 5) | Hourly YAML did not parse; the hourly and 15-min configs gave dates as `YYYY-MM-DD hh:mm:ss`, which NeuralHydrology cannot read (it expects `DD/MM/YYYY`); the MTS-LSTM config had a key NeuralHydrology does not know (`zero_center_target`, no effect); file names with commas; no seed in the daily configs | Fixed indentation, dates as `DD/MM/YYYY` (same days), unknown key removed, renamed files, seeds added | `test/test_configs/` |
 | 8 | 15-min forcing and discharge describe the same time steps (Sec. 3.1) | USGS local clock time used as if UTC | Converted to UTC with the `tz_cd` column (`qobs_15min_to_utc`, default true) | `datasetzoo/fifteenminutecamelsus.py` |
 
 Further v2 changes:
@@ -41,7 +41,7 @@ Further v2 changes:
 - At evaluation, a non-finite state (e.g. after a NaN forcing value) is reset instead of turning the rest of the basin's predictions into NaN.
 - The evaluation loss covers every scored time step.
 - Ablation switch `ablate_state_carry: true`: every flattened batch starts from a zero state, with everything else unchanged, to isolate the effect of carrying the state.
-- The non-persistent (baseline) training and evaluation paths are identical to upstream NeuralHydrology again (target noise and `UncertaintyTester` sampling restored).
+- The non-persistent (baseline) training and evaluation paths are identical to upstream NeuralHydrology again: target noise, `UncertaintyTester` sampling, finetuning (frozen modules), the validation-basin subset, `dynamic_learning_rate` (upstream fix #303) and the validation log line are as upstream, and samples of other models carry no `basin_idx`. `.github/workflows/model-isolation.yml` checks this bit for bit against upstream on every push.
 
 Not changed in the code (manuscript wording):
 - NeuralHydrology's masked MSE contains a factor 1/2 that Eq. 17 and 20 do not show. Changing it would change the effective learning rate of every model, so the equations should mention it instead.
@@ -109,6 +109,28 @@ Please cite this repository as:
 ```
 
 ---
+
+## Selecting the model in the config file
+
+The config file alone decides which model is trained and how; there is nothing else to switch. Train and evaluate any of them the usual way:
+
+```bash
+nh-run train --config-file test/test_configs/persistent_lstm_for_long_memory_basins.test.yml
+nh-run train --config-file test/test_configs/cuda_lstm_for_long_memory_basins.test.yml
+nh-run evaluate --run-dir <run directory>
+```
+
+| In the config file | What runs |
+|---|---|
+| `model: persistentlstm` and `persistent_state: true` | Persistent-State LSTM with the manuscript method (Sec. 2): per-basin state carried across non-overlapping chronological segments, interleaved basins, truncated BPTT, one continuous evaluation stream per basin |
+| `model: cudalstm`, `mtslstm`, `ealstm`, ... (no `persistent_state`) | That model with its original NeuralHydrology training and evaluation, unchanged |
+
+Where the code reads this:
+- `neuralhydrology/modelzoo/__init__.py` (`get_model`): the `model` key builds the network.
+- `neuralhydrology/utils/persistentutils.py` (`uses_persistent_state`): true only for `model: persistentlstm` with `persistent_state: true`. Only then do the trainer (`training/basetrainer.py`), the tester (`evaluation/tester.py`) and the dataset (`datasetzoo/basedataset.py`) switch to the persistent-state code; every other model takes the upstream code path.
+- `validate_persistent_config` in the same file stops the run at start-up if the keys do not fit together: `persistent_state: true` with another model, `model: persistentlstm` without `persistent_state: true`, or persistent settings that would break the method (see the guards above).
+
+So to switch models, use that model's own config file. Do not only change the `model:` line of a persistent config: the remaining persistent keys and the persistent sequence length would not describe the baseline, and the run stops with an error that points to the baseline config.
 
 ## Manuscript configuration files
 
