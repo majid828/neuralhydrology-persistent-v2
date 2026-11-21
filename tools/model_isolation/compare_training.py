@@ -176,6 +176,24 @@ def scenarios(group, repo=None, tmean_dir=None):
         upd = dict(DAILY, **UNCERTAINTY_COMMON, **UNCERTAINTY_HEADS["cmal"], mc_dropout=True)
         out["uncertainty_cmal_mcdropout"] = (_spec("daily_uncertainty", upd, eval_epoch=1), ALL_TREES, "upstream",
                                              ["v2fixed"])
+        # models without an upstream test configuration
+        out["mclstm"] = (_spec("daily_regression", dict(DAILY, model="mclstm", mass_inputs=["prcp(mm/day)"],
+                                                         dynamic_inputs=["tmax(C)"]), eval_epoch=1),
+                         ALL_TREES, "upstream", ["v2fixed"])
+        forecast = dict(DAILY, hindcast_inputs=["prcp(mm/day)", "tmax(C)"], forecast_inputs=["prcp(mm/day)", "tmax(C)"],
+                        forecast_seq_length=7, predict_last_n=7)
+        fc = {"type": "fc", "hiddens": [16], "activation": "tanh", "dropout": 0.0}
+        forecast_models = {
+            "handoff_forecast_lstm": dict(forecast, forecast_overlap=3, hindcast_hidden_size=16, forecast_hidden_size=16,
+                                          state_handoff_network=fc),
+            "multihead_forecast_lstm": dict(forecast, forecast_network=fc),
+            "sequential_forecast_lstm": dict(forecast),
+            "stacked_forecast_lstm": dict(forecast, hindcast_hidden_size=16, forecast_hidden_size=16,
+                                          bidirectional_stacked_forecast_lstm=False),
+        }
+        for model, upd in forecast_models.items():
+            out[model] = (_spec("daily_regression", dict(upd, model=model), eval_epoch=1), ALL_TREES, "upstream",
+                          ["v2fixed"])
     return out
 
 
