@@ -190,8 +190,9 @@ def scenarios(group, repo=None, tmean_dir=None):
                                           state_handoff_network=fc),
             "multihead_forecast_lstm": dict(forecast, forecast_network=fc),
             "sequential_forecast_lstm": dict(forecast),
-            "stacked_forecast_lstm": dict(forecast, hindcast_hidden_size=16, forecast_hidden_size=16,
-                                          bidirectional_stacked_forecast_lstm=False),
+            # stacked model: hindcast length (seq_length - forecast_seq_length + forecast_overlap) = forecast_seq_length
+            "stacked_forecast_lstm": dict(forecast, forecast_seq_length=20, forecast_overlap=10, hindcast_hidden_size=16,
+                                          forecast_hidden_size=16, bidirectional_stacked_forecast_lstm=False),
         }
         for model, upd in forecast_models.items():
             out[model] = (_spec("daily_regression", dict(upd, model=model), eval_epoch=1), ALL_TREES, "upstream",
