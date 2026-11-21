@@ -231,6 +231,7 @@ def build_dataset(series: Dict[str, Dict[str, np.ndarray]], seq_len: int, stride
     ds.is_train = is_train
     ds._persistent_training = is_train and persistent
     ds._basin_to_idx = {b: i for i, b in enumerate(series)}
+    ds._return_basin_idx = persistent
     cfg = _NS()
     cfg.forecast_seq_length = None
     cfg.hindcast_inputs_flattened = []
