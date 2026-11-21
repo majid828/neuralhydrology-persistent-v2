@@ -177,6 +177,8 @@ def scenarios(group, repo=None, tmean_dir=None):
         out["uncertainty_cmal_mcdropout"] = (_spec("daily_uncertainty", upd, eval_epoch=1), ALL_TREES, "upstream",
                                              ["v2fixed"])
         # models without an upstream test configuration
+        out["embcudalstm"] = (_spec("daily_regression_with_embedding", {"model": "embcudalstm"}, eval_epoch=1),
+                              ALL_TREES, "upstream", ["v2fixed"])
         out["mclstm"] = (_spec("daily_regression", dict(DAILY, model="mclstm", mass_inputs=["prcp(mm/day)"],
                                                          dynamic_inputs=["tmax(C)"]), eval_epoch=1),
                          ALL_TREES, "upstream", ["v2fixed"])
